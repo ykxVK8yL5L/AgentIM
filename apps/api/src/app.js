@@ -571,8 +571,9 @@ app.post('/api/room-templates/:id/create-room', async (c) => {
     if (!selectedAgent.model) return c.json({ ok: false, error: 'model_required', templateId: selectedAgent.templateId }, 400);
   }
 
+  const roomName = await uniqueRoomName(store, name, 'group');
   const room = await store.createRoom({
-    name,
+    name: roomName,
     type: 'group',
     description: String(input.description ?? template.roomDescription ?? template.description)
   });
@@ -867,54 +868,14 @@ app.post('/api/agents/:id/test', async (c) => {
   const agent = await store.getAgent(c.req.param('id'));
   if (!agent) return c.json({ ok: false, error: 'agent_not_found' }, 404);
 
-  const provider = await store.getProvider(agent.providerId);
-  if (!provider) return c.json({ ok: false, error: 'provider_not_found' }, 404);
-
-  const startedAt = Date.now();
   try {
-    if (provider.baseUrl === 'mock://provider') {
-      return c.json({
-        ok: true,
-        agentId: agent.id,
-        providerId: provider.id,
-        model: agent.model,
-        latencyMs: Date.now() - startedAt,
-        content: 'Mock agent test passed.'
-      });
-    }
-
-    const result = await createOpenAICompatibleChat({
-      baseUrl: provider.baseUrl,
-      apiKey: provider.apiKey,
-      model: agent.model,
-      maxTokens: 60,
-      messages: [
-        {
-          role: 'system',
-          content: 'You are performing a health check. Reply with one short sentence only.'
-        },
-        {
-          role: 'user',
-          content: 'Health check: can you respond?'
-        }
-      ]
-    }, await createProviderDeps(store));
-
-    return c.json({
-      ok: true,
-      agentId: agent.id,
-      providerId: provider.id,
-      model: result.model,
-      latencyMs: Date.now() - startedAt,
-      content: result.content
-    });
+    return c.json(await testAgentProvider(store, agent));
   } catch (error) {
     return c.json({
       ok: false,
       agentId: agent.id,
-      providerId: provider.id,
+      providerId: agent.providerId,
       model: agent.model,
-      latencyMs: Date.now() - startedAt,
       error: error instanceof Error ? error.message : String(error)
     }, 502);
   }
@@ -928,6 +889,49 @@ app.delete('/api/agents/:id', async (c) => {
   return c.json({ ok: true });
 });
 
+async function testAgentProvider(store, agent) {
+  const provider = await store.getProvider(agent.providerId);
+  if (!provider) throw new Error('provider_not_found');
+
+  const startedAt = Date.now();
+  if (provider.baseUrl === 'mock://provider') {
+    return {
+      ok: true,
+      agentId: agent.id,
+      providerId: provider.id,
+      model: agent.model,
+      latencyMs: Date.now() - startedAt,
+      content: 'Mock agent test passed.'
+    };
+  }
+
+  const result = await createOpenAICompatibleChat({
+    baseUrl: provider.baseUrl,
+    apiKey: provider.apiKey,
+    model: agent.model,
+    maxTokens: 60,
+    messages: [
+      {
+        role: 'system',
+        content: 'You are performing a health check. Reply with one short sentence only.'
+      },
+      {
+        role: 'user',
+        content: 'Health check: can you respond?'
+      }
+    ]
+  }, await createProviderDeps(store));
+
+  return {
+    ok: true,
+    agentId: agent.id,
+    providerId: provider.id,
+    model: result.model,
+    latencyMs: Date.now() - startedAt,
+    content: result.content
+  };
+}
+
 app.get('/api/rooms', async (c) => {
   const store = c.get('store');
   return c.json(await store.listRooms());
@@ -938,6 +942,8 @@ app.post('/api/rooms', async (c) => {
   const input = await c.req.json();
   const name = String(input.name ?? 'New Room').trim();
   if (!name) return c.json({ ok: false, error: 'name_required' }, 400);
+  const existing = await findRoomByName(store, name, input.type);
+  if (existing) return c.json({ ok: false, error: 'room_name_exists', room: existing }, 409);
   return c.json(await store.createRoom({
     name,
     type: input.type,
@@ -954,6 +960,8 @@ app.patch('/api/rooms/:id', async (c) => {
   const input = await c.req.json();
   const name = String(input.name ?? current.name ?? '').trim();
   if (!name) return c.json({ ok: false, error: 'name_required' }, 400);
+  const duplicate = await findRoomByName(store, name, input.type ?? current.type);
+  if (duplicate && duplicate.id !== current.id) return c.json({ ok: false, error: 'room_name_exists', room: duplicate }, 409);
 
   return c.json(await store.updateRoom(current.id, {
     name,
@@ -979,8 +987,11 @@ app.get('/api/conversations', async (c) => {
 app.post('/api/conversations', async (c) => {
   const store = c.get('store');
   const input = await c.req.json();
+  const name = String(input.name ?? 'New Conversation').trim();
+  const existing = await findRoomByName(store, name, input.type);
+  if (existing) return c.json({ ok: false, error: 'room_name_exists', room: existing }, 409);
   return c.json(await store.createRoom({
-    name: String(input.name ?? 'New Conversation').trim(),
+    name,
     type: input.type,
     description: String(input.description ?? ''),
     dmAgentId: input.dmAgentId ? String(input.dmAgentId) : undefined
@@ -1484,45 +1495,16 @@ app.post('/api/rooms/:roomId/projects', async (c) => {
   if (!name) return c.json({ ok: false, error: 'project_name_required' }, 400);
   if (!instructions) return c.json({ ok: false, error: 'project_instructions_required' }, 400);
 
-  const fallbackAgent = await store.getAgent(agentId);
-  if (!fallbackAgent) return c.json({ ok: false, error: 'agent_not_found' }, 404);
-
-  const slug = await uniqueProjectSlug(store, roomId, name);
-  const template = projectTemplateForType(type);
-  const distribution = await buildProjectDistribution(store, roomId, template, fallbackAgent.id);
-  const project = await store.createProject({
-    roomId,
-    name,
-    slug,
-    type,
-    templateId: template.id,
-    rootPath: `projects/${slug}`,
-    entryPath: `projects/${slug}/index.html`,
-    brief: instructions,
-    status: template.initialStatus,
-    currentPhase: template.phases[0]?.phase
-  });
-
-  const storage = createWorkspaceStorage();
-  const { workspace } = await withRoomWorkspace(store, roomId);
-  await storage.makeDirectory(workspace.id, project.rootPath);
-
-  const tasks = await createProjectTasksFromTemplate(store, project, template, distribution);
-  await store.createMessage({
-    roomId,
-    senderType: 'system',
-    senderName: 'AgentIM',
-    content: buildProjectCreatedMessage(project, tasks, distribution),
-    status: 'done',
-    pending: false
-  });
-  await startReadyProjectTasks(store, project.id);
-  return c.json({
-    ok: true,
-    project: await store.getProject(project.id),
-    tasks: await store.listProjectTasks(project.id),
-    distribution
-  }, 202);
+  try {
+    return c.json(await createRoomProject(store, roomId, {
+      agentId,
+      name,
+      type,
+      instructions
+    }), 202);
+  } catch (error) {
+    return c.json({ ok: false, error: error instanceof Error ? error.message : String(error) }, 400);
+  }
 });
 
 app.post('/api/projects/:id/archive', async (c) => {
@@ -1603,6 +1585,54 @@ app.patch('/api/project-tasks/:id', async (c) => {
   const updated = await store.updateProjectTask(task.id, { agentId: agent.id });
   return c.json({ ok: true, task: updated });
 });
+
+async function createRoomProject(store, roomId, input) {
+  const fallbackAgent = await store.getAgent(String(input.agentId ?? '').trim());
+  if (!fallbackAgent) throw new Error('agent_not_found');
+
+  const name = String(input.name ?? '').trim();
+  const instructions = String(input.instructions ?? '').trim();
+  if (!name) throw new Error('project_name_required');
+  if (!instructions) throw new Error('project_instructions_required');
+
+  const type = normalizeProjectType(input.type);
+  const slug = await uniqueProjectSlug(store, roomId, name);
+  const template = projectTemplateForType(type);
+  const distribution = await buildProjectDistribution(store, roomId, template, fallbackAgent.id);
+  const project = await store.createProject({
+    roomId,
+    name,
+    slug,
+    type,
+    templateId: template.id,
+    rootPath: `projects/${slug}`,
+    entryPath: `projects/${slug}/index.html`,
+    brief: instructions,
+    status: template.initialStatus,
+    currentPhase: template.phases[0]?.phase
+  });
+
+  const storage = createWorkspaceStorage();
+  const { workspace } = await withRoomWorkspace(store, roomId);
+  await storage.makeDirectory(workspace.id, project.rootPath);
+
+  const tasks = await createProjectTasksFromTemplate(store, project, template, distribution);
+  await store.createMessage({
+    roomId,
+    senderType: 'system',
+    senderName: 'AgentIM',
+    content: buildProjectCreatedMessage(project, tasks, distribution),
+    status: 'done',
+    pending: false
+  });
+  await startReadyProjectTasks(store, project.id);
+  return {
+    ok: true,
+    project: await store.getProject(project.id),
+    tasks: await store.listProjectTasks(project.id),
+    distribution
+  };
+}
 
 app.post('/api/rooms/:roomId/agent-runs', async (c) => {
   const store = c.get('store');
@@ -2285,9 +2315,28 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
     return;
   }
 
+  const room = await store.getRoom(run.roomId);
+  if (!room) {
+    await failAgentRun(store, run, 'room_not_found');
+    return;
+  }
+
   const roomAgents = await store.listRoomAgents(run.roomId);
   let content = '';
   let providerInvocation = null;
+  const providerDiagnostics = {
+    providerId: provider.id,
+    providerName: provider.name,
+    model: agent.model,
+    mode: 'mock',
+    fallbackUsed: false,
+    finishReason: '',
+    usage: null,
+    choiceCount: undefined,
+    streamCompleted: false,
+    streamError: '',
+    response: null
+  };
 
   try {
     const recentMessages = (await store.listMessages(run.roomId))
@@ -2296,7 +2345,7 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
       .filter((message) => !isInternalProviderErrorMessage(message));
     const recent = recentMessages.map((message) => ({
         role: message.senderType === 'agent' ? 'assistant' : 'user',
-        content: formatMessageForContext(message)
+        content: formatMessageForContext(message, { room, roomAgents })
       }));
     const workspaceScope = await resolveRunWorkspaceScope(store, run, agent, recentMessages);
 
@@ -2339,6 +2388,7 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
       });
       const providerDeps = await createProviderDeps(store);
       if (!providerDeps.proxyStreamingSupported) {
+        providerDiagnostics.mode = 'non_streaming';
         const fallback = await createOpenAICompatibleChat({
           baseUrl: provider.baseUrl,
           apiKey: provider.apiKey,
@@ -2348,12 +2398,20 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
           signal
         }, providerDeps);
         content = fallback.content;
+        Object.assign(providerDiagnostics, {
+          model: fallback.model ?? agent.model,
+          finishReason: fallback.finishReason ?? '',
+          usage: fallback.usage ?? null,
+          choiceCount: fallback.choiceCount,
+          response: fallback.response ?? null
+        });
         await store.updateMessage(run.messageId, {
-          content: content || 'Agent returned an empty response.',
+          content: content || formatEmptyProviderResponse(providerDiagnostics),
           status: 'running',
           pending: true
         });
       } else {
+        providerDiagnostics.mode = 'streaming';
         try {
           for await (const event of streamOpenAICompatibleChat({
             baseUrl: provider.baseUrl,
@@ -2371,9 +2429,26 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
                 pending: true
               });
             }
+            if (event.type === 'finish') {
+              providerDiagnostics.finishReason = event.reason ?? '';
+            }
+            if (event.type === 'usage') {
+              providerDiagnostics.usage = {
+                prompt_tokens: event.inputTokens ?? 0,
+                completion_tokens: event.outputTokens ?? 0
+              };
+            }
+            if (event.type === 'response') {
+              providerDiagnostics.response = event.http ?? null;
+            }
+            if (event.type === 'done') {
+              providerDiagnostics.streamCompleted = true;
+            }
           }
         } catch (error) {
           if (signal.aborted) throw error;
+          providerDiagnostics.fallbackUsed = true;
+          providerDiagnostics.streamError = error instanceof Error ? error.message : String(error);
           const fallback = await createOpenAICompatibleChat({
             baseUrl: provider.baseUrl,
             apiKey: provider.apiKey,
@@ -2383,8 +2458,16 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
             signal
           }, providerDeps);
           content = fallback.content;
+          Object.assign(providerDiagnostics, {
+            mode: 'streaming_fallback',
+            model: fallback.model ?? agent.model,
+            finishReason: fallback.finishReason ?? providerDiagnostics.finishReason,
+            usage: fallback.usage ?? providerDiagnostics.usage,
+            choiceCount: fallback.choiceCount,
+            response: fallback.response ?? providerDiagnostics.response
+          });
           await store.updateMessage(run.messageId, {
-            content: content || 'Agent returned an empty response.',
+            content: content || formatEmptyProviderResponse(providerDiagnostics),
             status: 'running',
             pending: true
           });
@@ -2395,7 +2478,8 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
           status: 'done',
           output: {
             model: agent.model,
-            contentLength: content.length
+            contentLength: content.length,
+            diagnostics: providerDiagnostics
           },
           completedAt: new Date().toISOString()
         });
@@ -2404,10 +2488,10 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
 
     if (signal.aborted || await isAgentRunStopped(store, run.id)) return;
 
-    const finalContent = content || 'Agent returned an empty response.';
-    const workspaceReads = await applyWorkspaceReadActions(store, run, finalContent, workspaceScope);
+    content = content || formatEmptyProviderResponse(providerDiagnostics);
+    const workspaceReads = await applyWorkspaceReadActions(store, run, content, workspaceScope);
     if (workspaceReads.length > 0) {
-      content = `${finalContent}\n\n${formatWorkspaceReadResults(workspaceReads)}`;
+      content = `${content}\n\n${formatWorkspaceReadResults(workspaceReads)}`;
       await store.updateMessage(run.messageId, {
         content,
         status: 'running',
@@ -2437,7 +2521,7 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
       });
     }
 
-    const roomMessages = await applyRoomMessageActions(store, run, finalContent, workspaceScope);
+    const roomMessages = await applyRoomMessageActions(store, run, content, workspaceScope);
     if (roomMessages.length > 0) {
       await store.createMessage({
         roomId: run.roomId,
@@ -2448,7 +2532,29 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
         pending: false
       });
     }
-    const roomManagementActions = await applyRoomManagementActions(store, run, finalContent, workspaceScope);
+    const roleActions = await applyRoleManagementActions(store, run, content);
+    if (roleActions.created.length > 0) {
+      await store.createMessage({
+        roomId: run.roomId,
+        senderType: 'system',
+        senderName: 'AgentIM',
+        content: `Roles created: ${roleActions.created.map((action) => action.roleName).join(', ')}.`,
+        status: 'done',
+        pending: false
+      });
+    }
+    const platformActions = await applyPlatformActions(store, run, content, workspaceScope);
+    if (platformActions.length > 0) {
+      await store.createMessage({
+        roomId: run.roomId,
+        senderType: 'system',
+        senderName: 'AgentIM',
+        content: `Platform actions completed: ${platformActions.map((action) => action.summary).join('; ')}.`,
+        status: 'done',
+        pending: false
+      });
+    }
+    const roomManagementActions = await applyRoomManagementActions(store, run, content, workspaceScope);
     if (roomManagementActions.created.length > 0 || roomManagementActions.assigned.length > 0) {
       const created = roomManagementActions.created.map((action) => action.roomName).join(', ');
       const assigned = roomManagementActions.assigned.map((action) => `${action.agentName} -> ${action.roomName}`).join(', ');
@@ -2465,7 +2571,7 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
       });
     }
 
-    await startMentionedAgentRuns(store, run, finalContent);
+    await startMentionedAgentRuns(store, run, content);
   } catch (error) {
     if ((signal.aborted && running?.abortReason === AGENT_RUN_ABORT_STOP) || error?.message === 'agent_run_stopped') {
       await store.updateAgentRun(run.id, {
@@ -2495,6 +2601,12 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
       await store.updateSkillInvocation(providerInvocation.id, {
         status: signal.aborted || error?.message === 'agent_run_stopped' ? 'rejected' : 'failed',
         error: error instanceof Error ? error.message : String(error),
+        output: {
+          diagnostics: {
+            ...providerDiagnostics,
+            response: error?.response ?? providerDiagnostics.response
+          }
+        },
         completedAt: new Date().toISOString()
       });
     }
@@ -2560,6 +2672,34 @@ async function failAgentRun(store, run, error, partialContent = '') {
   });
   await completeScheduledTaskForRun(store, run.id, 'failed', error);
   await completeProjectTaskForRun(store, run, 'failed', error, partialContent);
+}
+
+function formatEmptyProviderResponse(diagnostics = {}) {
+  const usage = diagnostics.usage ?? {};
+  const usageText = usage.prompt_tokens !== undefined || usage.completion_tokens !== undefined
+    ? `${usage.prompt_tokens ?? 0}/${usage.completion_tokens ?? 0}`
+    : '';
+  const details = [
+    diagnostics.providerName ? `Provider: ${diagnostics.providerName}` : '',
+    diagnostics.model ? `Model: ${diagnostics.model}` : '',
+    diagnostics.mode ? `Mode: ${diagnostics.mode}` : '',
+    diagnostics.finishReason ? `Finish reason: ${diagnostics.finishReason}` : '',
+    diagnostics.choiceCount !== undefined ? `Choices: ${diagnostics.choiceCount}` : '',
+    usageText ? `Tokens prompt/completion: ${usageText}` : '',
+    diagnostics.response?.status !== undefined ? `HTTP: ${diagnostics.response.status} ${diagnostics.response.statusText ?? ''}`.trim() : '',
+    diagnostics.response?.contentType ? `Content-Type: ${diagnostics.response.contentType}` : '',
+    diagnostics.response?.requestId ? `Request ID: ${diagnostics.response.requestId}` : '',
+    diagnostics.response?.bodyPreview ? `Response preview: ${diagnostics.response.bodyPreview}` : '',
+    diagnostics.streamError ? `Streaming error before fallback: ${diagnostics.streamError}` : '',
+    diagnostics.fallbackUsed ? 'Fallback: non-streaming retry was used' : ''
+  ].filter(Boolean);
+  return [
+    'Agent returned an empty response.',
+    '',
+    '[Provider diagnostics]',
+    ...details.map((detail) => `- ${detail}`),
+    details.length === 0 ? '- Provider returned no content and no additional metadata.' : ''
+  ].filter(Boolean).join('\n');
 }
 
 async function completeScheduledTaskForRun(store, runId, status, error) {
@@ -2938,6 +3078,515 @@ async function createRoomMessageInvocation(store, run, input) {
   });
 }
 
+async function applyRoleManagementActions(store, run, content) {
+  const createRequests = parseRoleCreateBlocks(content);
+  if (createRequests.length === 0) {
+    return { created: [] };
+  }
+
+  const agent = await store.getAgent(run.agentId);
+  const skills = await store.listSkills();
+  if (!await agentHasSkill(store, agent, 'role.create', skills)) {
+    throw new Error('agent_missing_role_create_skill');
+  }
+
+  const created = [];
+  for (const request of createRequests) {
+    const invocation = await createRoleManagementInvocation(store, run, 'role.create', {
+      action: 'create_role',
+      request
+    });
+    try {
+      const role = await store.createRole({
+        name: request.name,
+        description: request.description,
+        systemPrompt: request.systemPrompt,
+        skillIds: filterAvailableSkillIds(request.skillIds, skills)
+      });
+      await store.updateSkillInvocation(invocation.id, {
+        status: 'done',
+        output: {
+          roleId: role.id,
+          roleName: role.name,
+          skillIds: role.skillIds ?? []
+        },
+        completedAt: new Date().toISOString()
+      });
+      created.push({
+        roleId: role.id,
+        roleName: role.name,
+        skillIds: role.skillIds ?? []
+      });
+    } catch (error) {
+      await store.updateSkillInvocation(invocation.id, {
+        status: 'failed',
+        error: error instanceof Error ? error.message : String(error),
+        completedAt: new Date().toISOString()
+      });
+      throw error;
+    }
+  }
+
+  return { created };
+}
+
+async function createRoleManagementInvocation(store, run, skillId, input) {
+  return store.createSkillInvocation({
+    skillId,
+    roomId: run.roomId,
+    runId: run.id,
+    messageId: run.messageId,
+    agentId: run.agentId,
+    actorType: 'agent',
+    status: 'running',
+    input,
+    startedAt: new Date().toISOString()
+  });
+}
+
+function filterAvailableSkillIds(skillIds, skills) {
+  const enabled = new Set((skills ?? [])
+    .filter((skill) => skill?.enabled !== false)
+    .map((skill) => skill.id)
+    .filter(Boolean));
+  return normalizeSkillIdsInput(skillIds).filter((id) => enabled.has(id));
+}
+
+const PLATFORM_ACTION_SKILLS = {
+  'agent.read': 'agent.read',
+  'agent.create': 'agent.create',
+  'agent.update': 'agent.update',
+  'agent.test': 'agent.test',
+  'agent.delete': 'agent.delete',
+  'room.read': 'room.read',
+  'room.update': 'room.update',
+  'room.delete': 'room.delete',
+  'role.update': 'role.update',
+  'role.delete': 'role.delete',
+  'skill.read': 'skill.read',
+  'skill.install': 'skill.install',
+  'skill.update': 'skill.update',
+  'skill.delete': 'skill.delete',
+  'project.create': 'project.create',
+  'project.read': 'project.read',
+  'project.delete': 'project.delete',
+  'task.run': 'task.run',
+  'task.cancel': 'task.cancel',
+  'artifact.read': 'artifact.read',
+  'activity.read': 'activity.read',
+  'activity.clear': 'activity.clear',
+  'settings.update': 'settings.update',
+  'provider.create': 'provider.create',
+  'provider.update': 'provider.update',
+  'provider.delete': 'provider.delete',
+  'provider.probe': 'provider.probe'
+};
+
+async function applyPlatformActions(store, run, content, workspaceScope) {
+  const requests = parsePlatformActionBlocks(content);
+  if (requests.length === 0) return [];
+
+  const agent = await store.getAgent(run.agentId);
+  const skills = await store.listSkills();
+  const results = [];
+  for (const request of requests) {
+    const skillId = PLATFORM_ACTION_SKILLS[request.action];
+    if (!skillId) continue;
+    if (!await agentHasSkill(store, agent, skillId, skills)) {
+      throw new Error(`agent_missing_${skillId.replaceAll('.', '_')}_skill`);
+    }
+    const invocation = await createPlatformActionInvocation(store, run, skillId, request);
+    try {
+      const result = await executePlatformAction(store, run, request, workspaceScope, skills);
+      await store.updateSkillInvocation(invocation.id, {
+        status: 'done',
+        output: result.output,
+        completedAt: new Date().toISOString()
+      });
+      results.push({ action: request.action, summary: result.summary });
+    } catch (error) {
+      await store.updateSkillInvocation(invocation.id, {
+        status: 'failed',
+        error: error instanceof Error ? error.message : String(error),
+        completedAt: new Date().toISOString()
+      });
+      throw error;
+    }
+  }
+  return results;
+}
+
+async function createPlatformActionInvocation(store, run, skillId, request) {
+  return store.createSkillInvocation({
+    skillId,
+    roomId: run.roomId,
+    runId: run.id,
+    messageId: run.messageId,
+    agentId: run.agentId,
+    actorType: 'agent',
+    status: 'running',
+    input: request,
+    startedAt: new Date().toISOString()
+  });
+}
+
+async function executePlatformAction(store, run, request, workspaceScope, skills) {
+  const input = request.input ?? {};
+  if (request.action === 'agent.read') {
+    const agents = await store.listAgents();
+    return platformResult(`read ${agents.length} agents`, { agents });
+  }
+  if (request.action === 'agent.create') {
+    const provider = await resolvePlatformProvider(store, input.providerId);
+    const name = String(input.name ?? '').trim();
+    const model = String(input.model ?? provider?.defaultModel ?? provider?.models?.[0]?.id ?? '').trim();
+    if (!name) throw new Error('name_required');
+    if (!provider) throw new Error('provider_not_found');
+    if (!model) throw new Error('model_required');
+    const agent = await store.createAgent({
+      name,
+      bio: String(input.bio ?? '').trim(),
+      runtimeType: 'hosted_agent',
+      roleId: await normalizeAgentRoleId(store, input.roleId),
+      providerId: provider.id,
+      model,
+      status: 'online'
+    });
+    const roomRef = String(input.roomId ?? input.room ?? '').trim();
+    if (roomRef) {
+      const room = await resolveRoomManagementRoom(store, roomRef, workspaceScope);
+      if (!room) throw new Error(`room_not_found:${roomRef}`);
+      await store.attachAgentToRoom(room.id, agent.id, { triggerMode: 'manual' });
+    }
+    return platformResult(`created agent ${agent.name}`, { agent });
+  }
+  if (request.action === 'agent.update') {
+    const current = await resolvePlatformAgent(store, input.agentId ?? input.agent);
+    if (!current) throw new Error('agent_not_found');
+    const provider = input.providerId ? await resolvePlatformProvider(store, input.providerId) : await store.getProvider(current.providerId);
+    if (!provider) throw new Error('provider_not_found');
+    const agent = await store.updateAgent(current.id, {
+      name: String(input.name ?? current.name ?? '').trim() || current.name,
+      bio: String(input.bio ?? current.bio ?? '').trim(),
+      roleId: await normalizeAgentRoleId(store, input.roleId ?? current.roleId),
+      providerId: provider.id,
+      model: String(input.model ?? current.model ?? provider.defaultModel ?? '').trim(),
+      status: input.status ?? current.status ?? 'online'
+    });
+    return platformResult(`updated agent ${agent.name}`, { agent });
+  }
+  if (request.action === 'agent.test') {
+    const agent = await resolvePlatformAgent(store, input.agentId ?? input.agent);
+    if (!agent) throw new Error('agent_not_found');
+    const output = await testAgentProvider(store, agent);
+    return platformResult(`tested agent ${agent.name}`, output);
+  }
+  if (request.action === 'agent.delete') {
+    const agent = await resolvePlatformAgent(store, input.agentId ?? input.agent);
+    if (!agent) throw new Error('agent_not_found');
+    await store.deleteAgent(agent.id);
+    return platformResult(`deleted agent ${agent.name}`, { agent });
+  }
+  if (request.action === 'room.read') {
+    const rooms = await store.listRooms();
+    const roomAgents = await Promise.all(rooms.map(async (room) => ({
+      room,
+      agents: await store.listRoomAgents(room.id)
+    })));
+    return platformResult(`read ${rooms.length} rooms`, { rooms: roomAgents });
+  }
+  if (request.action === 'room.update') {
+    const room = await resolveRoomManagementRoom(store, input.roomId ?? input.room, workspaceScope);
+    if (!room) throw new Error('room_not_found');
+    if (!await agentCanManageRoom(store, run.agentId, room.id)) throw new Error(`agent_not_member_of_room:${room.name}`);
+    const updated = await store.updateRoom(room.id, {
+      name: String(input.name ?? room.name ?? '').trim() || room.name,
+      description: String(input.description ?? room.description ?? '').trim()
+    });
+    return platformResult(`updated room ${updated.name}`, { room: updated });
+  }
+  if (request.action === 'room.delete') {
+    const room = await resolveRoomManagementRoom(store, input.roomId ?? input.room, workspaceScope);
+    if (!room) throw new Error('room_not_found');
+    if (!await agentCanManageRoom(store, run.agentId, room.id)) throw new Error(`agent_not_member_of_room:${room.name}`);
+    await store.deleteRoom(room.id);
+    return platformResult(`deleted room ${room.name}`, { room });
+  }
+  if (request.action === 'role.update') {
+    const role = await resolvePlatformRole(store, input.roleId ?? input.role);
+    if (!role) throw new Error('role_not_found');
+    if (role.system) throw new Error('system_role_cannot_be_updated_by_agent');
+    const updated = await store.updateRole(role.id, {
+      name: String(input.name ?? role.name ?? '').trim() || role.name,
+      description: String(input.description ?? role.description ?? '').trim(),
+      systemPrompt: String(input.systemPrompt ?? role.systemPrompt ?? '').trim(),
+      skillIds: input.skillIds === undefined ? role.skillIds ?? [] : filterAvailableSkillIds(input.skillIds, skills)
+    });
+    return platformResult(`updated role ${updated.name}`, { role: updated });
+  }
+  if (request.action === 'role.delete') {
+    const role = await resolvePlatformRole(store, input.roleId ?? input.role);
+    if (!role) throw new Error('role_not_found');
+    if (role.system) throw new Error('system_role_cannot_be_deleted');
+    await store.deleteRole(role.id);
+    return platformResult(`deleted role ${role.name}`, { role });
+  }
+  if (request.action === 'skill.read') {
+    const allSkills = await store.listSkills();
+    return platformResult(`read ${allSkills.length} skills`, { skills: allSkills });
+  }
+  if (request.action === 'skill.install') {
+    const manifest = normalizeSkillManifestInput(input.manifest ?? input);
+    if (!manifest.ok) throw new Error(manifest.error);
+    const skill = await store.installSkill(manifest.skill);
+    return platformResult(`installed skill ${skill.id}`, { skill });
+  }
+  if (request.action === 'skill.update') {
+    const current = await store.getSkill(String(input.skillId ?? input.id ?? '').trim());
+    if (!current) throw new Error('skill_not_found');
+    if (current.common && input.enabled === false) throw new Error('common_skill_cannot_be_disabled');
+    const manifest = normalizeSkillManifestInput({
+      ...current,
+      ...input,
+      id: current.id,
+      common: current.common
+    });
+    if (!manifest.ok) throw new Error(manifest.error);
+    const skill = await store.updateSkill(current.id, manifest.skill);
+    return platformResult(`updated skill ${skill.id}`, { skill });
+  }
+  if (request.action === 'skill.delete') {
+    const skill = await store.getSkill(String(input.skillId ?? input.id ?? '').trim());
+    if (!skill) throw new Error('skill_not_found');
+    if (skill.common) throw new Error('common_skill_cannot_be_deleted');
+    await store.deleteSkill(skill.id);
+    return platformResult(`deleted skill ${skill.id}`, { skill });
+  }
+  if (request.action === 'project.read') {
+    const room = await resolveRoomManagementRoom(store, input.roomId ?? input.room, workspaceScope) ?? await store.getRoom(run.roomId);
+    const projects = await store.listProjects(room.id);
+    const tasks = await store.listProjectTasks(room.id, { byRoom: true });
+    return platformResult(`read ${projects.length} projects`, { room, projects, tasks });
+  }
+  if (request.action === 'project.create') {
+    const room = await resolveRoomManagementRoom(store, input.roomId ?? input.room, workspaceScope) ?? await store.getRoom(run.roomId);
+    if (!room) throw new Error('room_not_found');
+    const fallbackAgent = await resolvePlatformAgent(store, input.agentId ?? input.agent ?? run.agentId);
+    if (!fallbackAgent) throw new Error('agent_not_found');
+    const name = String(input.name ?? '').trim();
+    const instructions = String(input.instructions ?? input.brief ?? '').trim();
+    if (!name) throw new Error('project_name_required');
+    if (!instructions) throw new Error('project_instructions_required');
+    const result = await createRoomProject(store, room.id, {
+      agentId: fallbackAgent.id,
+      name,
+      type: input.type,
+      instructions
+    });
+    return platformResult(`created project ${result.project.name}`, result);
+  }
+  if (request.action === 'project.delete') {
+    const project = await store.getProject(String(input.projectId ?? input.project ?? '').trim());
+    if (!project) throw new Error('project_not_found');
+    const activeTasks = (await store.listProjectTasks(project.id))
+      .filter((task) => task.status === 'running' || task.status === 'queued' || task.status === 'blocked');
+    if (activeTasks.length > 0) throw new Error('project_has_active_tasks');
+    if (input.deleteFiles) {
+      const { workspace } = await withRoomWorkspace(store, project.roomId);
+      const storage = createWorkspaceStorage();
+      await storage.deleteFile(workspace.id, project.rootPath);
+    }
+    const deleted = await store.deleteProject(project.id);
+    return platformResult(`deleted project ${project.name}`, { project: deleted, deletedFiles: Boolean(input.deleteFiles) });
+  }
+  if (request.action === 'task.run') {
+    const task = await store.getScheduledTask(String(input.taskId ?? input.task ?? '').trim());
+    if (!task) throw new Error('task_not_found');
+    if (task.status !== 'scheduled') throw new Error('task_not_runnable');
+    await store.updateScheduledTask(task.id, { scheduleAt: new Date().toISOString() });
+    await dispatchDueScheduledTasks(store);
+    return platformResult(`queued task ${task.title}`, { task: await store.getScheduledTask(task.id) });
+  }
+  if (request.action === 'task.cancel') {
+    const task = await store.getScheduledTask(String(input.taskId ?? input.task ?? '').trim());
+    if (!task) throw new Error('task_not_found');
+    if (task.status !== 'scheduled') throw new Error('task_not_cancellable');
+    const cancelled = await store.updateScheduledTask(task.id, {
+      status: 'cancelled',
+      cancelledAt: new Date().toISOString()
+    });
+    return platformResult(`cancelled task ${cancelled.title}`, { task: cancelled });
+  }
+  if (request.action === 'artifact.read') {
+    const room = await resolveRoomManagementRoom(store, input.roomId ?? input.room, workspaceScope) ?? await store.getRoom(run.roomId);
+    const artifacts = await store.listArtifacts(room.id, { limit: normalizeInvocationLimitInput(input.limit) });
+    return platformResult(`read ${artifacts.length} artifacts`, { room, artifacts });
+  }
+  if (request.action === 'activity.read') {
+    const room = await resolveRoomManagementRoom(store, input.roomId ?? input.room, workspaceScope) ?? await store.getRoom(run.roomId);
+    const limit = normalizeInvocationLimitInput(input.limit);
+    return platformResult(`read room activity for ${room.name}`, {
+      room,
+      invocations: await store.listSkillInvocations(room.id, { limit }),
+      approvals: await store.listSkillApprovals(room.id, { limit })
+    });
+  }
+  if (request.action === 'activity.clear') {
+    const room = await resolveRoomManagementRoom(store, input.roomId ?? input.room, workspaceScope) ?? await store.getRoom(run.roomId);
+    if (!room) throw new Error('room_not_found');
+    const result = await store.clearRoomActivity(room.id);
+    return platformResult(`cleared activity for ${room.name}`, { room, ...result });
+  }
+  if (request.action === 'settings.update') {
+    const settings = await updatePlatformSettings(store, input);
+    return platformResult('updated system settings', { settings });
+  }
+  if (request.action === 'provider.create') {
+    const provider = await createPlatformProvider(store, input);
+    return platformResult(`created provider ${provider.name}`, { provider: publicProvider(provider) });
+  }
+  if (request.action === 'provider.update') {
+    const provider = await updatePlatformProvider(store, input);
+    return platformResult(`updated provider ${provider.name}`, { provider: publicProvider(provider) });
+  }
+  if (request.action === 'provider.delete') {
+    const provider = await resolvePlatformProvider(store, input.providerId ?? input.provider);
+    if (!provider) throw new Error('provider_not_found');
+    await store.deleteProvider(provider.id);
+    return platformResult(`deleted provider ${provider.name}`, { provider: publicProvider(provider) });
+  }
+  if (request.action === 'provider.probe') {
+    const provider = input.providerId || input.provider
+      ? await resolvePlatformProvider(store, input.providerId ?? input.provider)
+      : null;
+    const baseUrl = input.baseUrl ?? provider?.baseUrl;
+    const apiKey = input.apiKey ?? provider?.apiKey;
+    const result = input.listModels || input.models
+      ? await listOpenAICompatibleModels({ baseUrl, apiKey }, await createProviderDeps(store))
+      : await probeOpenAICompatibleProvider({ baseUrl, apiKey }, await createProviderDeps(store));
+    return platformResult('probed provider', result);
+  }
+  throw new Error(`unsupported_platform_action:${request.action}`);
+}
+
+function platformResult(summary, output) {
+  return { summary, output };
+}
+
+async function resolvePlatformAgent(store, ref) {
+  const requested = String(ref ?? '').trim();
+  if (!requested) return null;
+  const agents = await store.listAgents();
+  return agents.find((agent) => agent.id === requested)
+    ?? agents.find((agent) => roomNameMatches(agent.name, requested))
+    ?? null;
+}
+
+async function resolvePlatformProvider(store, ref) {
+  const providers = await store.listProviders();
+  const requested = String(ref ?? '').trim();
+  if (requested) {
+    return providers.find((provider) => provider.id === requested)
+      ?? providers.find((provider) => roomNameMatches(provider.name, requested))
+      ?? null;
+  }
+  return providers.find((provider) => provider.enabled !== false) ?? providers[0] ?? null;
+}
+
+async function resolvePlatformRole(store, ref) {
+  const requested = String(ref ?? '').trim();
+  if (!requested) return null;
+  const roles = await store.listRoles();
+  return roles.find((role) => role.id === requested)
+    ?? roles.find((role) => roomNameMatches(role.name, requested))
+    ?? null;
+}
+
+async function updatePlatformSettings(store, input) {
+  const current = await store.getSettings();
+  const proxyEnabled = input.network?.proxyEnabled === undefined
+    ? Boolean(current.network?.proxyEnabled)
+    : Boolean(input.network?.proxyEnabled);
+  const proxyUrl = String(input.network?.proxyUrl ?? current.network?.proxyUrl ?? '').trim();
+  const providerTimeoutMs = normalizeProviderTimeoutInput(input.network?.providerTimeoutMs ?? current.network?.providerTimeoutMs);
+  const messagePageSize = normalizeMessagePageSizeInput(input.chat?.messagePageSize ?? current.chat?.messagePageSize);
+  const approvalMode = normalizeApprovalModeInput(input.approvals?.mode ?? current.approvals?.mode);
+
+  if (proxyEnabled && proxyUrl) {
+    try {
+      const parsed = new URL(proxyUrl);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw new Error('proxy_url_must_be_http_or_https');
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message === 'proxy_url_must_be_http_or_https') throw error;
+      throw new Error('invalid_proxy_url');
+    }
+  }
+
+  return store.updateSettings({
+    network: {
+      proxyEnabled,
+      proxyUrl,
+      providerTimeoutMs
+    },
+    chat: {
+      messagePageSize
+    },
+    approvals: {
+      mode: approvalMode
+    }
+  });
+}
+
+async function createPlatformProvider(store, input) {
+  const name = String(input.name ?? '').trim();
+  const apiKey = String(input.apiKey ?? '').trim();
+  const defaultModel = String(input.defaultModel ?? '').trim();
+  if (!name) throw new Error('name_required');
+  if (!apiKey) throw new Error('api_key_required');
+  if (!defaultModel) throw new Error('default_model_required');
+  const baseUrl = normalizeProviderBaseUrl(input.baseUrl);
+  return store.createProvider({
+    name,
+    protocol: 'openai_chat_completions',
+    baseUrl,
+    apiKey,
+    defaultModel,
+    models: normalizeProviderModelInput(input.models, defaultModel),
+    enabled: true
+  });
+}
+
+async function updatePlatformProvider(store, input) {
+  const current = await resolvePlatformProvider(store, input.providerId ?? input.provider ?? input.id);
+  if (!current) throw new Error('provider_not_found');
+  const name = String(input.name ?? current.name ?? '').trim();
+  const defaultModel = String(input.defaultModel ?? current.defaultModel ?? '').trim();
+  if (!name) throw new Error('name_required');
+  if (!defaultModel) throw new Error('default_model_required');
+  const patch = {
+    name,
+    baseUrl: input.baseUrl === undefined ? current.baseUrl : normalizeProviderBaseUrl(input.baseUrl),
+    defaultModel,
+    models: input.models === undefined ? current.models : normalizeProviderModelInput(input.models, defaultModel),
+    enabled: input.enabled === undefined ? current.enabled : Boolean(input.enabled)
+  };
+  const apiKey = String(input.apiKey ?? '').trim();
+  if (apiKey) patch.apiKey = apiKey;
+  return store.updateProvider(current.id, patch);
+}
+
+function normalizeProviderBaseUrl(value) {
+  return value === 'mock://provider' ? 'mock://provider' : normalizeBaseUrl(value);
+}
+
+function normalizeProviderModelInput(models, defaultModel) {
+  return Array.isArray(models) && models.length > 0
+    ? models
+    : [{ id: defaultModel, name: defaultModel }];
+}
+
 async function applyRoomManagementActions(store, run, content, workspaceScope) {
   const createRequests = parseRoomCreateBlocks(content);
   const assignRequests = parseRoomAssignBlocks(content);
@@ -2963,12 +3612,14 @@ async function applyRoomManagementActions(store, run, content, workspaceScope) {
       request
     });
     try {
+      const existingRoom = await findRoomByName(store, request.name, request.type || 'group');
+      if (existingRoom) throw new Error(`room_name_exists:${existingRoom.name}`);
       const room = await store.createRoom({
         name: request.name,
         type: request.type || 'group',
         description: request.description
       });
-      const agents = await resolveRoomManagementAgents(store, request.agents);
+      const agents = await resolveRoomManagementAgents(store, request.agents, request.roles);
       const joins = [];
       for (const targetAgent of uniqueAgents([agent, ...agents]).filter(Boolean)) {
         const join = await store.attachAgentToRoom(room.id, targetAgent.id, { triggerMode: 'manual' });
@@ -3071,11 +3722,35 @@ async function resolveRoomManagementRoom(store, requestedRoom, workspaceScope) {
     ?? null;
 }
 
-async function resolveRoomManagementAgents(store, agentRefs) {
+async function findRoomByName(store, name, type) {
+  const requested = String(name ?? '').trim();
+  if (!requested) return null;
+  const normalizedType = type === 'dm' ? 'dm' : type === 'group' ? 'group' : '';
+  const rooms = await store.listRooms();
+  return rooms.find((room) => (
+    roomNameMatches(room.name, requested) &&
+    (!normalizedType || room.type === normalizedType)
+  )) ?? null;
+}
+
+async function uniqueRoomName(store, name, type) {
+  const base = String(name ?? '').trim() || 'New Room';
+  if (!await findRoomByName(store, base, type)) return base;
+  for (let index = 0; index < 12; index += 1) {
+    const suffix = randomBytes(3).toString('hex');
+    const candidate = `${base}-${suffix}`;
+    if (!await findRoomByName(store, candidate, type)) return candidate;
+  }
+  return `${base}-${Date.now().toString(36)}`;
+}
+
+async function resolveRoomManagementAgents(store, agentRefs, roleRefs = []) {
   const refs = Array.isArray(agentRefs) ? agentRefs : [];
-  if (refs.length === 0) return [];
+  const roleRequests = Array.isArray(roleRefs) ? roleRefs : [];
+  if (refs.length === 0 && roleRequests.length === 0) return [];
   const agents = await store.listAgents();
-  return uniqueAgents(refs
+  const roles = roleRequests.length > 0 ? await store.listRoles() : [];
+  const directAgents = refs
     .map((ref) => {
       const requested = String(ref ?? '').trim();
       if (!requested) return null;
@@ -3083,7 +3758,20 @@ async function resolveRoomManagementAgents(store, agentRefs) {
         ?? agents.find((agent) => roomNameMatches(agent.name, requested))
         ?? null;
     })
-    .filter(Boolean));
+    .filter(Boolean);
+  const roleAgents = roleRequests.flatMap((ref) => {
+    const role = resolveRoomManagementRole(roles, ref);
+    return role ? agents.filter((agent) => agent.roleId === role.id) : [];
+  });
+  return uniqueAgents([...directAgents, ...roleAgents]);
+}
+
+function resolveRoomManagementRole(roles, ref) {
+  const requested = String(ref ?? '').trim();
+  if (!requested) return null;
+  return roles.find((role) => role.id === requested)
+    ?? roles.find((role) => roomNameMatches(role.name, requested))
+    ?? null;
 }
 
 async function agentCanManageRoom(store, agentId, roomId) {
@@ -3208,6 +3896,41 @@ function parseRoomMessageBlocks(content) {
   return blocks.slice(0, 16);
 }
 
+function parseRoleCreateBlocks(content) {
+  const blocks = [];
+  const pattern = /```agentim-role-create\s*\n([\s\S]*?)```/g;
+  for (const match of String(content ?? '').matchAll(pattern)) {
+    const payload = parseJsonBlock(match[1]);
+    if (!payload) continue;
+    const name = String(payload.name ?? '').trim();
+    const systemPrompt = String(payload.systemPrompt ?? '').trim();
+    if (!name || !systemPrompt) continue;
+    blocks.push({
+      name,
+      description: String(payload.description ?? '').trim(),
+      systemPrompt,
+      skillIds: normalizeSkillIdsInput(payload.skillIds ?? payload.skills).slice(0, 32)
+    });
+  }
+  return blocks.slice(0, 8);
+}
+
+function parsePlatformActionBlocks(content) {
+  const blocks = [];
+  const pattern = /```agentim-platform-action\s*\n([\s\S]*?)```/g;
+  for (const match of String(content ?? '').matchAll(pattern)) {
+    const payload = parseJsonBlock(match[1]);
+    if (!payload) continue;
+    const action = String(payload.action ?? '').trim();
+    if (!action || !PLATFORM_ACTION_SKILLS[action]) continue;
+    blocks.push({
+      action,
+      input: normalizeJsonObject(payload.input, {})
+    });
+  }
+  return blocks.slice(0, 12);
+}
+
 function parseRoomCreateBlocks(content) {
   const blocks = [];
   const pattern = /```agentim-room-create\s*\n([\s\S]*?)```/g;
@@ -3220,7 +3943,8 @@ function parseRoomCreateBlocks(content) {
       name,
       description: String(payload.description ?? '').trim(),
       type: ['group', 'dm'].includes(payload.type) ? payload.type : 'group',
-      agents: normalizeStringList(payload.agents ?? payload.agentIds ?? payload.agentNames).slice(0, 16)
+      agents: normalizeStringList(payload.agents ?? payload.agentIds ?? payload.agentNames).slice(0, 16),
+      roles: normalizeStringList(payload.roles ?? payload.roleIds ?? payload.roleNames).slice(0, 16)
     });
   }
   return blocks.slice(0, 8);
@@ -3262,6 +3986,10 @@ function parseInlineAttribute(header, name) {
 function normalizeStringList(value) {
   const list = Array.isArray(value) ? value : String(value ?? '').split(',');
   return list.map((item) => String(item ?? '').trim()).filter(Boolean);
+}
+
+function normalizeJsonObject(value, fallback) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : fallback;
 }
 
 function stripParsedInlineAttributes(header, names) {
@@ -3705,11 +4433,32 @@ async function resolveReplyTo(store, roomId, replyToMessageId) {
   };
 }
 
-function formatMessageForContext(message) {
+function formatMessageForContext(message, context = {}) {
   const replyContext = message.replyTo && !isInternalProviderErrorContent(message.replyTo.content)
     ? ` (replying to ${message.replyTo.senderName}: ${message.replyTo.content})`
     : '';
-  return `${message.senderName}${replyContext}: ${message.content}`;
+  return `${message.senderName}${replyContext}: ${formatMessageContentForContext(message, context)}`;
+}
+
+function formatMessageContentForContext(message, context = {}) {
+  const content = String(message.content ?? '');
+  if (context.room?.type !== 'dm' || message.senderType !== 'user') return content;
+  return stripDirectRoomAddressing(content, context.roomAgents);
+}
+
+function stripDirectRoomAddressing(content, roomAgents = []) {
+  let next = String(content ?? '').trim();
+  for (const agent of roomAgents) {
+    const name = String(agent?.name ?? '').trim();
+    if (!name) continue;
+    const escaped = escapeRegExp(name).replace(/\\ /g, '\\s+');
+    next = next.replace(new RegExp(`^@${escaped}(?=$|[\\s，。！？、,.!?:;；：）)\\]}])`, 'i'), '').trimStart();
+  }
+  return next || content;
+}
+
+function escapeRegExp(value) {
+  return String(value ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function isInternalProviderErrorMessage(message) {
@@ -3742,6 +4491,13 @@ function buildAgentSystemPrompt(agent, roomAgents, workspaceContext = '', role, 
   const skills = skillIds.length > 0
     ? `\n\nEnabled skills available to this Agent: ${skillIds.join(', ')}.`
     : '\n\nNo enabled skills are currently available to this Agent.';
+  const roleDirectory = skillSet.has('role.read')
+    ? `\n\nAvailable Agent roles for planning rooms: ${formatRoleDirectory()}. Use role ids when selecting by role.`
+    : '\n\nYou do not have role.read enabled. Do not claim to inspect the Agent role directory.';
+  const roleCreate = skillSet.has('role.create')
+    ? `\n\nYou can create a custom Agent role by emitting this controlled JSON block:\n\`\`\`agentim-role-create\n{"name":"Role name","description":"What this role is for","systemPrompt":"Instructions for Agents assigned to this role.","skillIds":["provider.chat","workspace.read","agent.message"]}\n\`\`\`\nUse this when existing roles do not fit the user's requested specialization. Use only existing skill ids; unavailable skill ids will be ignored. Do not claim a role was created unless you emitted the block.`
+    : '\n\nYou do not have role.create enabled. Do not claim to create roles.';
+  const platformActions = buildPlatformActionPrompt(skillSet);
   const workspaceRead = skillSet.has('workspace.read')
     ? `\n\nYou can inspect the ${workspaceScope?.isExternal ? `target room workspace (${workspaceScope.room.name})` : 'current room workspace'} by emitting controlled fenced blocks.\n\nList a directory:\n\`\`\`agentim-list-dir path=\"relative/dir\"\`\`\`\nUse an empty path to list the workspace root:\n\`\`\`agentim-list-dir path=\"\"\`\`\`\n\nRead a file:\n\`\`\`agentim-read-file path=\"relative/path.txt\"\`\`\`\n\nUse these read blocks when you need file contents before answering or editing.`
     : '\n\nYou do not have workspace.read enabled. Do not claim to read workspace files.';
@@ -3752,7 +4508,7 @@ function buildAgentSystemPrompt(agent, roomAgents, workspaceContext = '', role, 
     ? `\n\nYou can send a message into a room where you are already a member by emitting a controlled fenced block. To send to the target room, use this exact multi-line format:\n\`\`\`agentim-room-message room="${workspaceScope?.isExternal ? workspaceScope.room.name : 'Room Name'}"\nmessage text here\n\`\`\`\nPut the message body on the line after the opening fence. If the user asks you in a DM to notify or update another room, use this block. Do not claim a message was sent unless you emitted the block.`
     : '\n\nYou do not have agent.message enabled. Do not claim to send messages to other rooms.';
   const roomCreate = skillSet.has('room.create')
-    ? `\n\nYou can create a new group room by emitting this controlled JSON block:\n\`\`\`agentim-room-create\n{"name":"Room name","description":"Purpose of the room","agents":["Agent Name"]}\n\`\`\`\nThe agents array is optional; you will automatically be added to rooms you create. Use existing Agent names or ids only.`
+    ? `\n\nYou can create a new group room by emitting this controlled JSON block:\n\`\`\`agentim-room-create\n{"name":"Room name","description":"Purpose of the room","agents":["Agent Name"],"roles":["designer","full-stack-developer"]}\n\`\`\`\nThe agents and roles arrays are optional; you will automatically be added to rooms you create. Use existing Agent names/ids or existing role ids/names only. Role selection attaches existing Agents with those roles; it does not create new Agents.`
     : '\n\nYou do not have room.create enabled. Do not claim to create rooms.';
   const roomAssign = skillSet.has('room.assign')
     ? `\n\nYou can attach existing Agents to an existing room by emitting this controlled JSON block:\n\`\`\`agentim-room-assign\n{"room":"Room name","agents":["Agent Name"],"triggerMode":"manual"}\n\`\`\`\nUse existing room and Agent names or ids only. Do not claim Agents were assigned unless you emitted the block.`
@@ -3764,7 +4520,23 @@ function buildAgentSystemPrompt(agent, roomAgents, workspaceContext = '', role, 
   const userApproval = skillSet.has('user.request_approval')
     ? `\n\nWhen you need an explicit user decision, emit a controlled approval request block:\n\`\`\`agentim-approval-request\n{\n  "title": "Decision title",\n  "reason": "Why approval is needed",\n  "approveLabel": "Approve",\n  "rejectLabel": "Reject",\n  "details": ["optional detail"]\n}\n\`\`\`\nUse this for risky, costly, ambiguous, or user-owned decisions.`
     : '\n\nYou do not have user.request_approval enabled. Mention @user in plain text for decisions instead.';
-  return `${legacyAgentPrompt}${rolePrompt}${collaboration}\n\nThe human user is @user. Mention @user when you need confirmation, missing requirements, or a decision from the user. @user is not an automated Agent.${approvalGuidance}${skills}${workspace}${workspaceRead}${workspaceWrite}${roomMessaging}${roomCreate}${roomAssign}${taskPlanning}${userApproval}`;
+  return `${legacyAgentPrompt}${rolePrompt}${collaboration}\n\nThe human user is @user. Mention @user when you need confirmation, missing requirements, or a decision from the user. @user is not an automated Agent.${approvalGuidance}${skills}${roleDirectory}${roleCreate}${platformActions}${workspace}${workspaceRead}${workspaceWrite}${roomMessaging}${roomCreate}${roomAssign}${taskPlanning}${userApproval}`;
+}
+
+function formatRoleDirectory() {
+  return DEFAULT_ROLES
+    .map((role) => `${role.id} (${role.name}: ${role.description})`)
+    .join('; ');
+}
+
+function buildPlatformActionPrompt(skillSet) {
+  const actions = Object.entries(PLATFORM_ACTION_SKILLS)
+    .filter(([, skillId]) => skillSet.has(skillId))
+    .map(([action]) => action);
+  if (actions.length === 0) {
+    return '\n\nYou do not have platform action skills enabled. Do not claim to operate platform APIs beyond explicit protocol blocks listed here.';
+  }
+  return `\n\nYou can operate selected platform APIs by emitting controlled JSON blocks:\n\`\`\`agentim-platform-action\n{"action":"agent.read","input":{}}\n\`\`\`\nAvailable platform actions for you: ${actions.join(', ')}. Use this for reading or changing Agents, Rooms, Roles, Skills, Projects, Tasks, Artifacts, and Activity when the matching action is listed. Do not claim a platform action completed unless you emitted the block.`;
 }
 
 function buildProjectRequestContent({ name, type, instructions }) {

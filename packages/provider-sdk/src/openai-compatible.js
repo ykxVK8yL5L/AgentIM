@@ -163,8 +163,13 @@ export async function* streamOpenAICompatibleChat(input, deps = {}) {
     releaseSignal();
     clearTimeout(timeout);
     const detail = await safeReadText(res);
-    throw new Error(`provider_request_failed:${res.status}:${detail.slice(0, 300)}`);
+    throw createProviderRequestError(res, detail);
   }
+
+  yield {
+    type: 'response',
+    http: responseInfoFromResponse(res)
+  };
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -218,6 +223,13 @@ export async function* streamOpenAICompatibleChat(input, deps = {}) {
         yield { type: 'text_delta', text };
       }
 
+      if (choice?.finish_reason) {
+        yield {
+          type: 'finish',
+          reason: choice.finish_reason
+        };
+      }
+
       if (parsed.usage) {
         yield {
           type: 'usage',
@@ -267,20 +279,25 @@ export async function createOpenAICompatibleChat(input, deps = {}) {
 
     if (!res.ok) {
       const detail = await safeReadText(res);
-      throw new Error(`provider_request_failed:${res.status}:${detail.slice(0, 300)}`);
+      throw createProviderRequestError(res, detail);
     }
 
-    const body = await res.json();
-    const content = body?.choices?.[0]?.message?.content ?? '';
+    const raw = await res.text();
+    const body = raw ? JSON.parse(raw) : {};
+    const choice = body?.choices?.[0];
+    const content = choice?.message?.content ?? '';
     return {
       id: body?.id,
       model: body?.model ?? input.model,
       content: String(content),
-      usage: body?.usage
+      finishReason: choice?.finish_reason,
+      usage: body?.usage,
+      choiceCount: Array.isArray(body?.choices) ? body.choices.length : 0,
+      response: responseInfoFromResponse(res, raw)
     };
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error('provider_request_failed:timeout');
+      throw createProviderTimeoutError();
     }
     throw error;
   } finally {
@@ -306,4 +323,27 @@ async function safeReadText(res) {
   } catch {
     return '';
   }
+}
+
+function responseInfoFromResponse(res, bodyText = '') {
+  return {
+    ok: res.ok,
+    status: res.status,
+    statusText: res.statusText,
+    contentType: res.headers.get('content-type') ?? '',
+    requestId: res.headers.get('x-request-id') ?? res.headers.get('x-amzn-requestid') ?? res.headers.get('x-correlation-id') ?? '',
+    bodyPreview: String(bodyText ?? '').slice(0, 1500)
+  };
+}
+
+function createProviderRequestError(res, detail = '') {
+  const error = new Error(`provider_request_failed:${res.status}:${String(detail ?? '').slice(0, 300)}`);
+  error.response = responseInfoFromResponse(res, detail);
+  return error;
+}
+
+function createProviderTimeoutError() {
+  const error = new Error('provider_request_failed:timeout');
+  error.response = { ok: false, status: 0, statusText: 'timeout', contentType: '', requestId: '', bodyPreview: '' };
+  return error;
 }

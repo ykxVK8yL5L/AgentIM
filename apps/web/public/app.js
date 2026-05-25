@@ -72,6 +72,7 @@ const state = {
   conversationSearch: '',
   roomTemplateSearch: '',
   roomTemplateCategory: 'all',
+  skillCategory: 'all',
   agentTemplateSearch: '',
   agentTemplateCategory: 'all',
   roomInspectorOpen: false,
@@ -160,6 +161,7 @@ const els = {
   skillCount: document.querySelector('#skill-count'),
   skillSubmit: document.querySelector('#skill-submit'),
   skillCancel: document.querySelector('#skill-cancel'),
+  skillCategoryTabs: document.querySelector('#skill-category-tabs'),
   agentForm: document.querySelector('#agent-form'),
   agentList: document.querySelector('#agent-list'),
   agentCount: document.querySelector('#agent-count'),
@@ -354,7 +356,7 @@ els.roomForm.addEventListener('submit', async (event) => {
     renderAll();
     alert(editing ? 'Room updated successfully.' : 'Room created successfully.');
   } catch (error) {
-    alert(`Room ${editing ? 'update' : 'creation'} failed: ${error instanceof Error ? error.message : String(error)}`);
+    alert(`Room ${editing ? 'update' : 'creation'} failed: ${roomErrorMessage(error)}`);
   }
 });
 
@@ -978,6 +980,16 @@ function authErrorMessage(error) {
     password_min_length_6: 'Password must be at least 6 characters.'
   };
   return messages[code] ?? 'Authentication failed.';
+}
+
+function roomErrorMessage(error) {
+  const code = error?.data?.error ?? error?.message;
+  const messages = {
+    room_name_exists: 'A room with this name already exists.',
+    name_required: 'Room name is required.',
+    room_not_found: 'Room was not found.'
+  };
+  return messages[code] ?? (error instanceof Error ? error.message : String(error));
 }
 
 function clearLegacyPasswordStorage() {
@@ -1621,38 +1633,29 @@ function roleSkillSummary(role) {
 function renderSkills() {
   const enabledCount = enabledSkills().length;
   els.skillCount.textContent = `${enabledCount}/${state.skills.length}`;
-  els.skillList.innerHTML = state.skills
-    .map((skill) => {
-      const badges = [
-        skill.common ? 'Common' : 'Installed',
-        skill.enabled === false ? 'Disabled' : 'Enabled',
-        skill.riskLevel ? `Risk: ${skill.riskLevel}` : null,
-        approvalBadgeForSkill(skill)
-      ].filter(Boolean).join(' · ');
-      const runtime = skill.runtime?.kind
-        ? `${skill.runtime.kind}${skill.runtime.adapter ? `:${skill.runtime.adapter}` : ''}`
-        : 'runtime: unknown';
+  renderSkillCategoryTabs();
+  const visibleSkills = state.skillCategory === 'all'
+    ? state.skills
+    : state.skills.filter((skill) => skillCategoryId(skill) === state.skillCategory);
+  const grouped = groupSkillsByCategory(visibleSkills);
+  els.skillList.innerHTML = grouped
+    .map(({ category, skills }) => {
+      const groupEnabled = skills.filter((skill) => skill.enabled !== false).length;
       return `
-        <div class="entity-item ${skill.enabled === false ? '' : 'active'}">
-          <div class="entity-main">
-            <strong>${escapeHtml(skill.name)} · ${escapeHtml(skill.id)}</strong>
-            <span>${escapeHtml(skill.description || 'No description')}</span>
-            <span>${escapeHtml(skill.category ?? 'custom')} · v${escapeHtml(skill.version ?? '1.0.0')} · ${escapeHtml(runtime)}</span>
-            <span>${escapeHtml(badges)}</span>
+        <section class="skill-category-group">
+          <div class="skill-category-heading">
+            <strong>${escapeHtml(titleCase(category))}</strong>
+            <span>${groupEnabled}/${skills.length}</span>
           </div>
-          <div class="entity-actions">
-            <button type="button" data-edit-skill="${escapeHtml(skill.id)}">Manifest</button>
-            ${skill.common
-              ? ''
-              : skill.enabled === false
-                ? `<button type="button" data-enable-skill="${escapeHtml(skill.id)}">Enable</button>`
-                : `<button type="button" data-disable-skill="${escapeHtml(skill.id)}">Disable</button>`}
-            ${skill.common ? '' : `<button type="button" class="danger-button" data-delete-skill="${escapeHtml(skill.id)}">Delete</button>`}
+          <div class="skill-category-list">
+            ${skills.map(renderSkillItem).join('')}
           </div>
-        </div>
+        </section>
       `;
-    })
-    .join('');
+    }).join('');
+  if (grouped.length === 0) {
+    els.skillList.innerHTML = '<div class="muted-empty">No skills in this category.</div>';
+  }
 
   for (const item of els.skillList.querySelectorAll('[data-edit-skill]')) {
     item.addEventListener('click', () => {
@@ -1691,6 +1694,89 @@ function renderSkills() {
       renderAll();
     });
   }
+}
+
+function renderSkillCategoryTabs() {
+  if (!els.skillCategoryTabs) return;
+  const categories = skillCategoryOptions();
+  const current = categories.some((item) => item.id === state.skillCategory) ? state.skillCategory : 'all';
+  state.skillCategory = current;
+  els.skillCategoryTabs.innerHTML = categories.map((item) => `
+    <button type="button" class="${item.id === current ? 'active' : ''}" data-skill-category="${escapeHtml(item.id)}">
+      <span>${escapeHtml(item.label)}</span>
+      <span>${item.count}</span>
+    </button>
+  `).join('');
+  for (const item of els.skillCategoryTabs.querySelectorAll('[data-skill-category]')) {
+    item.addEventListener('click', () => {
+      state.skillCategory = item.getAttribute('data-skill-category') || 'all';
+      renderSkills();
+    });
+  }
+}
+
+function skillCategoryOptions() {
+  const counts = new Map();
+  for (const skill of state.skills) {
+    const id = skillCategoryId(skill);
+    counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+  return [
+    { id: 'all', label: 'All', count: state.skills.length },
+    ...[...counts.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([id, count]) => ({ id, label: titleCase(id), count }))
+  ];
+}
+
+function skillCategoryId(skill) {
+  return String(skill?.category ?? 'custom').trim() || 'custom';
+}
+
+function renderSkillItem(skill) {
+  const badges = [
+    skill.common ? 'Common' : 'Installed',
+    skill.enabled === false ? 'Disabled' : 'Enabled',
+    skill.riskLevel ? `Risk: ${skill.riskLevel}` : null,
+    approvalBadgeForSkill(skill)
+  ].filter(Boolean).join(' · ');
+  const runtime = skill.runtime?.kind
+    ? `${skill.runtime.kind}${skill.runtime.adapter ? `:${skill.runtime.adapter}` : ''}`
+    : 'runtime: unknown';
+  return `
+    <div class="entity-item ${skill.enabled === false ? '' : 'active'}">
+      <div class="entity-main">
+        <strong>${escapeHtml(skill.name)} · ${escapeHtml(skill.id)}</strong>
+        <span>${escapeHtml(skill.description || 'No description')}</span>
+        <span>v${escapeHtml(skill.version ?? '1.0.0')} · ${escapeHtml(runtime)}</span>
+        <span>${escapeHtml(badges)}</span>
+      </div>
+      <div class="entity-actions">
+        <button type="button" data-edit-skill="${escapeHtml(skill.id)}">Manifest</button>
+        ${skill.common
+          ? ''
+          : skill.enabled === false
+            ? `<button type="button" data-enable-skill="${escapeHtml(skill.id)}">Enable</button>`
+            : `<button type="button" data-disable-skill="${escapeHtml(skill.id)}">Disable</button>`}
+        ${skill.common ? '' : `<button type="button" class="danger-button" data-delete-skill="${escapeHtml(skill.id)}">Delete</button>`}
+      </div>
+    </div>
+  `;
+}
+
+function groupSkillsByCategory(skills) {
+  const groups = new Map();
+  for (const skill of skills) {
+    const category = String(skill.category ?? 'custom').trim() || 'custom';
+    if (!groups.has(category)) groups.set(category, []);
+    groups.get(category).push(skill);
+  }
+  return [...groups.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([category, items]) => ({
+      category,
+      skills: items.slice().sort((left, right) => String(left.name ?? left.id).localeCompare(String(right.name ?? right.id)))
+    }));
 }
 
 function approvalBadgeForSkill(skill) {
@@ -3824,7 +3910,8 @@ function setReplyTarget(message) {
     senderName: message.senderName,
     content: String(message.content ?? '').slice(0, 180)
   };
-  if (message.senderType === 'agent' && !messageMentionsAgent(els.messageForm.elements.content.value, message.senderName)) {
+  const room = state.rooms.find((item) => item.id === state.activeRoomId);
+  if (room?.type !== 'dm' && message.senderType === 'agent' && !messageMentionsAgent(els.messageForm.elements.content.value, message.senderName)) {
     prependMention(message.senderName);
   }
   renderReplyPreview();
@@ -5194,6 +5281,25 @@ function formatInvocationTime(invocation) {
 }
 
 function formatInspectorActivity(invocation) {
+  if (invocation.skillId === 'provider.chat') {
+    const diagnostics = invocation.output?.diagnostics ?? {};
+    const usage = diagnostics.usage ?? {};
+    const tokens = usage.prompt_tokens !== undefined || usage.completion_tokens !== undefined
+      ? ` · tokens ${usage.prompt_tokens ?? 0}/${usage.completion_tokens ?? 0}`
+      : '';
+    const finish = diagnostics.finishReason ? ` · finish ${diagnostics.finishReason}` : '';
+    const fallback = diagnostics.fallbackUsed ? ' · fallback' : '';
+    const streamError = diagnostics.streamError ? ` · stream error: ${diagnostics.streamError}` : '';
+    const http = diagnostics.response?.status !== undefined
+      ? ` · HTTP ${diagnostics.response.status}${diagnostics.response.statusText ? ` ${diagnostics.response.statusText}` : ''}`
+      : '';
+    const body = diagnostics.response?.bodyPreview ? ` · body: ${summarizeInline(diagnostics.response.bodyPreview, 140)}` : '';
+    return {
+      title: `Provider chat · ${invocation.status}`,
+      meta: `${diagnostics.providerName ?? invocation.input?.providerId ?? 'Provider'} · ${diagnostics.model ?? invocation.input?.model ?? 'model'}`,
+      detail: `${diagnostics.mode ?? 'chat'}${http}${finish}${tokens}${fallback}${streamError}${body}`
+    };
+  }
   if (invocation.skillId === 'agent.message') {
     const source = invocation.output?.sourceRoomName ?? invocation.input?.sourceRoomName ?? 'Unknown room';
     const target = invocation.output?.roomName ?? invocation.input?.targetRoomName ?? 'Unknown room';

@@ -2706,6 +2706,75 @@ button.inspector-section-title[type="button"]::before {
   margin-top: 12px;
 }
 
+.skill-category-group {
+  display: grid;
+  gap: 10px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
+
+.skill-category-group:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.skill-category-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text);
+}
+
+.skill-category-heading span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.skill-category-list {
+  display: grid;
+  gap: 10px;
+}
+
+.category-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.category-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--muted);
+}
+
+.category-tabs button span:last-child {
+  min-width: 20px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: var(--soft);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.category-tabs button.active {
+  border-color: rgba(15, 123, 108, 0.42);
+  background: rgba(15, 123, 108, 0.08);
+  color: var(--accent);
+}
+
+.category-tabs button.active span:last-child {
+  background: rgba(15, 123, 108, 0.14);
+  color: var(--accent);
+}
+
 .search-field {
   position: relative;
   display: block;
