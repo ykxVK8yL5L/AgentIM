@@ -1,0 +1,595 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AgentIM</title>
+    <link rel="stylesheet" href="/styles.css?v=20260525-mobile-tabs-aligned" />
+  </head>
+  <body>
+    <div class="auth-gate" id="auth-gate" hidden>
+      <form class="auth-card" id="auth-form">
+        <div>
+          <strong>AgentIM</strong>
+          <h1 id="auth-title">Login</h1>
+          <p id="auth-help">Enter your local access password.</p>
+        </div>
+        <label>
+          Password
+          <input name="password" type="password" autocomplete="current-password" minlength="6" required />
+        </label>
+        <button type="submit" id="auth-submit">Login</button>
+        <p class="auth-error" id="auth-error"></p>
+      </form>
+    </div>
+    <button type="button" class="password-reminder" id="password-reminder" hidden>
+      Login password is not set. Click to set it in Settings.
+    </button>
+
+    <header class="mobile-app-bar">
+      <div class="mobile-room">
+        <strong>AgentIM</strong>
+        <span id="mobile-room-title">Conversation</span>
+      </div>
+      <button type="button" class="mobile-icon-button mobile-rooms-button" id="mobile-chat-list-toggle" aria-label="Rooms" title="Rooms"></button>
+      <button type="button" class="mobile-icon-button mobile-info-button" id="mobile-room-info-toggle" aria-label="Room info" title="Room info"></button>
+      <div class="status-pill" id="mobile-api-status">...</div>
+    </header>
+
+    <div class="app-shell" id="app-shell">
+      <aside class="primary-nav app-pane">
+        <div class="brand-mark">A</div>
+        <nav class="primary-nav-links" aria-label="Primary">
+          <button type="button" class="active" data-app-section-button="chats" onclick="window.activateAppSection && window.activateAppSection('chats')">
+            <span class="nav-icon chat-icon"></span>
+            <em>Chats</em>
+          </button>
+          <button type="button" data-app-section-button="circles" onclick="window.activateAppSection && window.activateAppSection('circles')">
+            <span class="nav-icon circle-icon"></span>
+            <em>Circles</em>
+          </button>
+          <button type="button" data-app-section-button="contacts" onclick="window.activateAppSection && window.activateAppSection('contacts')">
+            <span class="nav-icon contact-icon"></span>
+            <em>Contacts</em>
+          </button>
+          <button type="button" data-app-section-button="resources" onclick="window.activateAppSection && window.activateAppSection('resources')">
+            <span class="nav-icon resource-icon"></span>
+            <em>Resources</em>
+          </button>
+          <button type="button" data-app-section-button="settings" onclick="window.activateAppSection && window.activateAppSection('settings')">
+            <span class="nav-icon setting-icon"></span>
+            <em>Settings</em>
+          </button>
+        </nav>
+        <button type="button" class="user-pill">ME</button>
+      </aside>
+
+      <aside class="sidebar app-pane panel-stack">
+        <section class="panel app-section active" data-app-section-panel="chats">
+          <div class="panel-heading">
+            <h2>Chats</h2>
+            <span id="room-count">0</span>
+          </div>
+          <label class="search-field">
+            <span></span>
+            <input id="conversation-search" placeholder="Search chats" />
+          </label>
+          <div class="segment">
+            <button type="button" class="active" data-conversation-filter="all">All</button>
+            <button type="button" data-conversation-filter="rooms">Rooms</button>
+            <button type="button" data-conversation-filter="agents">Agents</button>
+          </div>
+          <div id="conversation-list" class="entity-list"></div>
+        </section>
+
+        <section class="panel app-section" data-app-section-panel="circles">
+          <div class="panel-heading">
+            <h2>Circles</h2>
+            <span id="room-template-count">0</span>
+          </div>
+          <details class="circle-builder">
+            <summary>Add Circle</summary>
+            <form id="circle-form" class="stack">
+              <label>
+                Circle Name
+                <input name="name" placeholder="AI Short Film Studio" required />
+              </label>
+              <label>
+                Category
+                <input name="category" placeholder="media" value="custom" required />
+              </label>
+              <label>
+                Description
+                <textarea name="description" rows="3" placeholder="What kind of project does this circle support?" required></textarea>
+              </label>
+              <label>
+                Default Room Name
+                <input name="roomName" placeholder="AI Short Film Room" />
+              </label>
+              <label>
+                Room Rules / Goal
+                <textarea name="roomDescription" rows="3" placeholder="Goals, rules, workflow, and expected deliverables"></textarea>
+              </label>
+              <div class="circle-agent-picker">
+                <strong>Agent Templates</strong>
+                <div id="circle-agent-template-list" class="circle-template-picker"></div>
+              </div>
+              <button type="submit">Save Circle</button>
+            </form>
+          </details>
+          <label class="search-field">
+            <span></span>
+            <input id="room-template-search" placeholder="Search circles" />
+          </label>
+          <select id="room-template-category" class="filter-select" aria-label="Circle category">
+            <option value="all">All categories</option>
+          </select>
+          <div id="room-template-list" class="entity-list circle-grid"></div>
+        </section>
+
+        <section class="panel app-section" data-app-section-panel="contacts">
+          <div class="panel-heading">
+            <h2>Contacts</h2>
+            <span id="agent-count">0</span>
+          </div>
+          <div class="section-tabs" role="tablist" aria-label="Contacts sections">
+            <button type="button" class="active" data-section-tab="contacts:agents" onclick="window.activateSectionTab && window.activateSectionTab('contacts:agents')">Agents</button>
+            <button type="button" data-section-tab="contacts:groups" onclick="window.activateSectionTab && window.activateSectionTab('contacts:groups')">Groups</button>
+            <button type="button" data-section-tab="contacts:create" onclick="window.activateSectionTab && window.activateSectionTab('contacts:create')">Create</button>
+            <button type="button" data-section-tab="contacts:templates" onclick="window.activateSectionTab && window.activateSectionTab('contacts:templates')">Templates</button>
+          </div>
+
+          <div class="section-tab-panel active" data-section-panel="contacts:agents">
+            <section class="panel-inner">
+              <div class="panel-heading">
+                <h2>Agents</h2>
+                <span>All</span>
+              </div>
+              <div id="agent-list" class="entity-list"></div>
+            </section>
+          </div>
+
+          <div class="section-tab-panel" data-section-panel="contacts:groups">
+            <section class="panel-inner">
+              <div class="panel-heading">
+                <h2>Groups</h2>
+                <span id="room-count-copy">0</span>
+              </div>
+              <div id="room-list" class="entity-list"></div>
+            </section>
+          </div>
+
+          <div class="section-tab-panel" data-section-panel="contacts:create">
+            <section class="panel-inner">
+              <div class="panel-heading">
+                <h2>Room</h2>
+                <span>Create</span>
+              </div>
+              <form id="room-form" class="stack">
+                <label>
+                  Room Name
+                  <input name="name" value="Product Room" required />
+                </label>
+                <div class="button-row">
+                  <button type="submit" id="room-submit">Create Room</button>
+                  <button type="button" id="room-cancel" class="secondary-button" hidden>Cancel</button>
+                </div>
+              </form>
+            </section>
+
+            <section class="panel-inner">
+              <div class="panel-heading">
+                <h2>Agent</h2>
+              </div>
+              <form id="agent-form" class="stack">
+                <label>
+                  Name
+                  <input name="name" value="Launch Agent" required />
+                </label>
+                <label>
+                  Role
+                  <select name="roleId" required></select>
+                </label>
+                <label>
+                  Provider
+                  <select name="providerId" required></select>
+                </label>
+                <label>
+                  Model
+                  <select name="model" required></select>
+                </label>
+                <div class="button-row">
+                  <button type="submit" id="agent-submit">Create Agent</button>
+                  <button type="button" id="agent-cancel" class="secondary-button" hidden>Cancel</button>
+                </div>
+              </form>
+            </section>
+          </div>
+
+          <div class="section-tab-panel" data-section-panel="contacts:templates">
+            <section class="panel-inner">
+              <div class="panel-heading">
+                <h2>Agent Templates</h2>
+                <span id="agent-template-count">0</span>
+              </div>
+              <label class="search-field">
+                <span></span>
+                <input id="agent-template-search" placeholder="Search templates" />
+              </label>
+              <select id="agent-template-category" class="filter-select" aria-label="Agent template category">
+                <option value="all">All categories</option>
+              </select>
+              <div id="agent-template-list" class="entity-list"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="panel app-section" data-app-section-panel="resources">
+          <div class="panel-heading">
+            <h2>Resources</h2>
+            <span>All</span>
+          </div>
+          <div class="section-tabs" role="tablist" aria-label="Resources sections">
+            <button type="button" class="active" data-section-tab="resources:project" onclick="window.activateSectionTab && window.activateSectionTab('resources:project')">Project</button>
+            <button type="button" data-section-tab="resources:tasks" onclick="window.activateSectionTab && window.activateSectionTab('resources:tasks')">Tasks</button>
+            <button type="button" data-section-tab="resources:workspace" onclick="window.activateSectionTab && window.activateSectionTab('resources:workspace')">Workspace</button>
+          </div>
+
+          <div class="section-tab-panel active" data-section-panel="resources:project">
+            <section class="panel-inner">
+            <div class="panel-heading">
+              <h2>Project</h2>
+              <span>Create</span>
+            </div>
+            <form id="project-form" class="stack">
+              <label>
+                Agent
+                <select name="agentId" required></select>
+              </label>
+              <label>
+                Project Name
+                <input name="name" value="New Web Project" required />
+              </label>
+              <label>
+                Type
+                <select name="type">
+                  <option value="static-web">Static Web</option>
+                  <option value="web-app">Web App</option>
+                  <option value="document-site">Document Site</option>
+                  <option value="prototype">Prototype</option>
+                </select>
+              </label>
+              <label>
+                Brief
+                <textarea name="instructions" rows="4" placeholder="What should this project do?" required></textarea>
+              </label>
+              <button type="submit">Create Project</button>
+            </form>
+            <div id="project-distribution" class="entity-list"></div>
+            </section>
+
+            <section class="panel-inner">
+              <div class="panel-heading">
+                <h2>Projects</h2>
+                <span>Work</span>
+              </div>
+              <div id="project-list" class="entity-list"></div>
+              <div id="project-task-list" class="entity-list"></div>
+            </section>
+          </div>
+
+          <div class="section-tab-panel" data-section-panel="resources:tasks">
+            <section class="panel-inner">
+              <div class="panel-heading">
+                <h2>Tasks</h2>
+                <span id="task-count">0</span>
+              </div>
+              <form id="task-form" class="stack">
+                <label>
+                  Title
+                  <input name="title" value="Follow up task" required />
+                </label>
+                <label>
+                  Agent
+                  <select name="agentId" required></select>
+                </label>
+                <label>
+                  Schedule At
+                  <input name="scheduleAt" type="datetime-local" required />
+                </label>
+                <label>
+                  Repeat
+                  <select name="repeatInterval">
+                    <option value="">None</option>
+                    <option value="daily">Daily</option>
+                    <option value="weekly">Weekly</option>
+                  </select>
+                </label>
+                <label>
+                  Instructions
+                  <textarea name="instructions" rows="4" placeholder="What should the Agent do at that time?" required></textarea>
+                </label>
+                <button type="submit">Schedule Task</button>
+              </form>
+              <div id="task-list" class="entity-list"></div>
+            </section>
+          </div>
+
+          <div class="section-tab-panel" data-section-panel="resources:workspace">
+            <section class="panel-inner">
+              <div class="panel-heading">
+                <h2>Workspace</h2>
+                <span id="workspace-meta">No room selected</span>
+              </div>
+              <a id="workspace-export" class="secondary-link" href="#" download>Export</a>
+              <div class="work-tabs" role="tablist" aria-label="Room work surface">
+              <button type="button" class="active" data-work-tab="work">Work</button>
+              <button type="button" data-work-tab="projects">Projects</button>
+              <button type="button" data-work-tab="files">Files</button>
+              <button type="button" data-work-tab="preview">Preview</button>
+              <button type="button" data-work-tab="activity">Activity</button>
+            </div>
+            <div class="work-tab-panel active" data-work-panel="work">
+              <div class="panel-heading">
+                <h2>Agent Work</h2>
+                <span id="agent-work-count">0</span>
+              </div>
+              <div id="agent-work-list" class="entity-list"></div>
+            </div>
+            <div class="work-tab-panel" data-work-panel="files">
+              <div class="workspace-toolbar">
+                <input id="workspace-path" placeholder="src/index.js" />
+                <div class="button-row">
+                  <button type="button" id="workspace-new-file">New File</button>
+                  <button type="button" id="workspace-new-dir" class="secondary-button">New Dir</button>
+                </div>
+              </div>
+              <div id="workspace-files" class="workspace-files"></div>
+              <form id="workspace-editor" class="workspace-editor">
+                <label>
+                  Open File
+                  <input name="path" placeholder="Select or enter a file path" />
+                </label>
+                <textarea name="content" rows="12" spellcheck="false" placeholder="File content"></textarea>
+                <div class="button-row">
+                  <button type="submit">Save File</button>
+                  <button type="button" id="workspace-delete" class="danger-button">Delete</button>
+                </div>
+              </form>
+            </div>
+            <div class="work-tab-panel" data-work-panel="preview">
+              <div class="preview-header">
+                <div>
+                  <h2>Preview</h2>
+                  <p id="preview-meta">No preview selected</p>
+                </div>
+                <button type="button" id="preview-open" class="secondary-button">Open Full Page</button>
+              </div>
+              <div class="preview-toolbar">
+                <input id="preview-path" placeholder="hello-web/index.html" />
+                <button type="button" id="preview-refresh">Preview</button>
+              </div>
+              <iframe id="preview-frame" title="Workspace preview" sandbox="allow-scripts allow-forms allow-modals"></iframe>
+            </div>
+            <div class="work-tab-panel" data-work-panel="activity">
+              <section class="skill-activity">
+                <div class="panel-heading">
+                  <h2>Skill Activity</h2>
+                  <span id="skill-invocation-count">0</span>
+                </div>
+                <div id="skill-invocation-list" class="entity-list"></div>
+              </section>
+              <section class="artifact-panel">
+                <div class="panel-heading">
+                  <h2>Artifacts</h2>
+                  <span id="artifact-count">0</span>
+                </div>
+                <div id="artifact-list" class="entity-list"></div>
+              </section>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="panel app-section" data-app-section-panel="settings">
+          <div class="panel-heading">
+            <h2>Settings</h2>
+            <span>Global</span>
+          </div>
+          <div class="section-tabs" role="tablist" aria-label="Settings sections">
+            <button type="button" class="active" data-section-tab="settings:network" onclick="window.activateSectionTab && window.activateSectionTab('settings:network')">Network</button>
+            <button type="button" data-section-tab="settings:providers" onclick="window.activateSectionTab && window.activateSectionTab('settings:providers')">Providers</button>
+            <button type="button" data-section-tab="settings:roles" onclick="window.activateSectionTab && window.activateSectionTab('settings:roles')">Roles</button>
+            <button type="button" data-section-tab="settings:skills" onclick="window.activateSectionTab && window.activateSectionTab('settings:skills')">Skills</button>
+          </div>
+
+          <div class="section-tab-panel active" data-section-panel="settings:network">
+            <section class="panel-inner">
+              <div class="panel-heading">
+                <h2>Network</h2>
+                <span>Global</span>
+              </div>
+              <div class="auth-warning" id="password-warning" hidden>
+                Login password is not set. Set one below to protect this workspace.
+              </div>
+              <form id="password-form" class="stack settings-subform">
+                <label>
+                  Current Password
+                  <input name="currentPassword" type="password" autocomplete="current-password" />
+                </label>
+                <label>
+                  New Login Password
+                  <input name="password" type="password" autocomplete="new-password" minlength="6" required />
+                </label>
+                <button type="submit">Save Login Password</button>
+              </form>
+              <form id="settings-form" class="stack">
+              <label class="checkbox-label">
+                <input name="proxyEnabled" type="checkbox" />
+                Enable Provider Proxy
+              </label>
+              <label>
+                Proxy URL
+                <input name="proxyUrl" placeholder="http://127.0.0.1:7890" />
+              </label>
+              <label>
+                Provider Timeout (ms)
+                <input name="providerTimeoutMs" type="number" min="5000" max="300000" step="1000" value="60000" />
+              </label>
+              <label>
+                Message Page Size
+                <input name="messagePageSize" type="number" min="10" max="100" step="1" value="20" />
+              </label>
+              <label>
+                Approval Mode
+                <select name="approvalMode">
+                  <option value="off">Off - allow everything</option>
+                  <option value="auto">Auto - only high risk asks</option>
+                  <option value="balanced">Balanced - medium/high asks</option>
+                  <option value="strict">Strict - ask more often</option>
+                </select>
+              </label>
+                <button type="submit">Save Settings</button>
+              </form>
+            </section>
+          </div>
+
+          <div class="section-tab-panel" data-section-panel="settings:providers">
+            <section class="panel-inner">
+              <div class="panel-heading">
+                <h2>Model Provider</h2>
+                <span id="provider-count">0</span>
+              </div>
+              <form id="provider-form" class="stack">
+              <label>
+                Name
+                <input name="name" value="Mock Provider" required />
+              </label>
+              <label>
+                Base URL
+                <input name="baseUrl" value="mock://provider" required />
+              </label>
+              <label>
+                API Key
+                <input name="apiKey" value="mock-key" type="password" required />
+              </label>
+              <label>
+                Default Model
+                <input name="defaultModel" value="mock-agent" required />
+              </label>
+              <div class="button-row">
+                <button type="button" id="probe-provider">Probe</button>
+                <button type="submit" id="provider-submit">Save</button>
+              </div>
+              <button type="button" id="provider-cancel" class="secondary-button" hidden>Cancel Editing</button>
+            </form>
+              <pre id="probe-result" class="result-box"></pre>
+              <div id="provider-list" class="entity-list"></div>
+            </section>
+          </div>
+
+          <div class="section-tab-panel" data-section-panel="settings:roles">
+            <section class="panel-inner">
+              <div class="panel-heading">
+                <h2>Roles</h2>
+                <span id="role-count">0</span>
+              </div>
+              <form id="role-form" class="stack">
+              <label>
+                Name
+                <input name="name" value="General" required />
+              </label>
+              <label>
+                Description
+                <textarea name="description" rows="2" placeholder="What this role is responsible for"></textarea>
+              </label>
+              <label>
+                Role Instructions
+                <textarea name="systemPrompt" rows="4" placeholder="Default behavior and responsibilities for agents using this role"></textarea>
+              </label>
+              <label>
+                Role Skills
+                <select name="skillIds" multiple size="6"></select>
+              </label>
+              <div class="button-row">
+                <button type="submit" id="role-submit">Create Role</button>
+                <button type="button" id="role-cancel" class="secondary-button" hidden>Cancel</button>
+              </div>
+            </form>
+              <div id="role-list" class="entity-list"></div>
+            </section>
+          </div>
+
+          <div class="section-tab-panel" data-section-panel="settings:skills">
+            <section class="panel-inner">
+              <div class="panel-heading">
+                <h2>Skills</h2>
+                <span id="skill-count">0</span>
+              </div>
+              <form id="skill-form" class="stack">
+              <label>
+                Skill Manifest
+                <textarea name="manifest" rows="12" spellcheck="false"></textarea>
+              </label>
+              <div class="button-row">
+                <button type="submit" id="skill-submit">Install Skill</button>
+                <button type="button" id="skill-cancel" class="secondary-button" hidden>Cancel</button>
+              </div>
+            </form>
+              <div id="skill-list" class="entity-list"></div>
+            </section>
+          </div>
+        </section>
+      </aside>
+
+      <main class="chat app-pane" data-mobile-pane="chat">
+        <header class="chat-header">
+          <div>
+            <h2 id="conversation-title">Conversation</h2>
+            <p>Web-first MVP: custom provider, hosted Agent, streaming reply.</p>
+          </div>
+          <div class="chat-header-actions">
+            <button type="button" id="room-inspector-toggle" class="secondary-button">Room</button>
+            <div class="status-pill" id="api-status">Connecting</div>
+          </div>
+        </header>
+
+        <div class="chat-body">
+          <div id="messages" class="messages"></div>
+          <button type="button" id="scroll-latest" class="scroll-latest" hidden>Latest</button>
+          <aside id="room-inspector" class="room-inspector" hidden>
+            <div class="room-inspector-header">
+              <div>
+                <h2>Room</h2>
+                <span id="room-inspector-title">No room selected</span>
+              </div>
+              <button type="button" id="room-inspector-close" class="secondary-button">Close</button>
+            </div>
+            <div id="room-inspector-content" class="room-inspector-content"></div>
+          </aside>
+        </div>
+
+        <form id="message-form" class="composer">
+          <div id="mention-bar" class="mention-bar"></div>
+          <div id="reply-preview" class="reply-preview" hidden></div>
+          <textarea name="content" rows="3" placeholder="Message @agent or @all..." required></textarea>
+          <div class="composer-actions">
+            <div id="response-status" class="response-status" aria-live="polite"></div>
+            <button type="button" id="stop-response" class="secondary-button" hidden>Stop</button>
+            <button type="submit" id="send-message">Send</button>
+          </div>
+        </form>
+      </main>
+    </div>
+
+    <nav class="mobile-tabbar" aria-label="Main navigation">
+      <button type="button" class="active" data-app-section-button="chats" onclick="window.activateAppSection && window.activateAppSection('chats')">Chats</button>
+      <button type="button" data-app-section-button="circles" onclick="window.activateAppSection && window.activateAppSection('circles')">Circles</button>
+      <button type="button" data-app-section-button="contacts" onclick="window.activateAppSection && window.activateAppSection('contacts')">Contacts</button>
+      <button type="button" data-app-section-button="resources" onclick="window.activateAppSection && window.activateAppSection('resources')">Resources</button>
+      <button type="button" data-app-section-button="settings" onclick="window.activateAppSection && window.activateAppSection('settings')">Settings</button>
+    </nav>
+
+    <script type="module" src="/app.js?v=20260525-mobile-tabs-aligned"></script>
+  </body>
+</html>

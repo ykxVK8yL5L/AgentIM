@@ -1,0 +1,23 @@
+{
+  "name": "agentim",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node apps/api/src/server.js",
+    "start": "node apps/api/src/server.js",
+    "check": "node --check apps/api/src/app.js && node --check apps/api/src/server.js && node --check apps/api/src/store/utils.js && node --check apps/api/src/store/memory-store.js && node --check apps/api/src/store/sqlite-store.js && node --check apps/api/src/agent-templates/agency-agents.js && node --check apps/api/src/agent-templates/room-templates.js && node --check apps/web/public/app.js && node --check packages/provider-sdk/src/openai-compatible.js && node --check scripts/smoke.mjs && node --check scripts/recovery-smoke.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "smoke:recovery": "node scripts/recovery-smoke.mjs"
+  },
+  "packageManager": "pnpm@10.10.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "dependencies": {
+    "@hono/node-server": "^2.0.2",
+    "hono": "^4.12.19",
+    "undici": "^6.25.0"
+  }
+}

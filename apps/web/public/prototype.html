@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AgentIM Prototype</title>
+    <link rel="stylesheet" href="/prototype.css" />
+  </head>
+  <body>
+    <div class="app-frame">
+      <aside class="primary-nav" aria-label="Primary">
+        <div class="app-mark">A</div>
+        <nav>
+          <button class="active" aria-label="Chats">
+            <span class="nav-icon chat-icon"></span>
+            <em>Chats</em>
+          </button>
+          <button aria-label="Contacts">
+            <span class="nav-icon contact-icon"></span>
+            <em>Contacts</em>
+          </button>
+          <button aria-label="Resources">
+            <span class="nav-icon resource-icon"></span>
+            <em>Resources</em>
+          </button>
+          <button aria-label="Settings">
+            <span class="nav-icon setting-icon"></span>
+            <em>Settings</em>
+          </button>
+        </nav>
+        <button class="user-pill" aria-label="Current user">ME</button>
+      </aside>
+
+      <aside class="object-list" aria-label="Chats list">
+        <header class="list-header">
+          <div>
+            <strong>Chats</strong>
+            <span>Rooms and agent DMs</span>
+          </div>
+          <button class="add-button" aria-label="Create chat"></button>
+        </header>
+
+        <label class="search-field">
+          <span></span>
+          <input placeholder="Search chats" />
+        </label>
+
+        <div class="segment">
+          <button class="active">All</button>
+          <button>Rooms</button>
+          <button>Agents</button>
+        </div>
+
+        <section class="list-group">
+          <div class="group-title">
+            <span>Pinned</span>
+            <small>2</small>
+          </div>
+
+          <button class="list-item active">
+            <span class="room-avatars">
+              <i class="avatar product">PM</i>
+              <i class="avatar design">UI</i>
+              <i class="avatar dev">FS</i>
+            </span>
+            <span class="item-copy">
+              <strong>Launch Website</strong>
+              <small>3 agents working, review queued</small>
+            </span>
+            <span class="item-meta">
+              <time>now</time>
+              <b>3</b>
+            </span>
+          </button>
+
+          <button class="list-item">
+            <span class="avatar product">PM</span>
+            <span class="item-copy">
+              <strong>Nova Product</strong>
+              <small>Project brief ready for review</small>
+            </span>
+            <span class="item-meta">
+              <time>2m</time>
+              <i class="status-dot"></i>
+            </span>
+          </button>
+        </section>
+
+        <section class="list-group">
+          <div class="group-title">
+            <span>Recent</span>
+            <small>4</small>
+          </div>
+
+          <button class="list-item">
+            <span class="avatar design">UI</span>
+            <span class="item-copy">
+              <strong>Iris Designer</strong>
+              <small>Shared mobile layout pass</small>
+            </span>
+            <span class="item-meta"><time>9m</time></span>
+          </button>
+
+          <button class="list-item">
+            <span class="avatar dev">FS</span>
+            <span class="item-copy">
+              <strong>Atlas Full-stack</strong>
+              <small>Waiting on product constraints</small>
+            </span>
+            <span class="item-meta"><time>21m</time></span>
+          </button>
+
+          <button class="list-item">
+            <span class="room-avatars two">
+              <i class="avatar dev">FS</i>
+              <i class="avatar review">QA</i>
+            </span>
+            <span class="item-copy">
+              <strong>Widget Lab</strong>
+              <small>Preview card needs polish</small>
+            </span>
+            <span class="item-meta"><time>1h</time></span>
+          </button>
+        </section>
+      </aside>
+
+      <main class="content-area" aria-label="Main content">
+        <header class="content-header">
+          <button class="mobile-menu">Chats</button>
+          <span class="room-avatars">
+            <i class="avatar product">PM</i>
+            <i class="avatar design">UI</i>
+            <i class="avatar dev">FS</i>
+          </span>
+          <div class="title-block">
+            <strong>Launch Website</strong>
+            <span>Room · Product, Design, Full-stack, Review</span>
+          </div>
+          <div class="header-actions">
+            <button>Members</button>
+            <button>Project</button>
+            <button>More</button>
+          </div>
+        </header>
+
+        <section class="main-layout">
+          <section class="chat-panel">
+            <div class="timeline">
+              <div class="day-divider">Today</div>
+
+              <article class="message agent">
+                <span class="avatar product">PM</span>
+                <div class="bubble">
+                  <header>
+                    <strong>Nova Product</strong>
+                    <time>10:18</time>
+                  </header>
+                  <p>I split the project into product, design, development, and review tracks. Design and development can run in parallel after the brief is accepted.</p>
+                  <div class="mini-card">
+                    <div>
+                      <strong>Project plan</strong>
+                      <small>4 tasks · 2 ready · 1 waiting</small>
+                    </div>
+                    <button>Open</button>
+                  </div>
+                </div>
+              </article>
+
+              <article class="message user">
+                <div class="bubble">
+                  <header>
+                    <strong>You</strong>
+                    <time>10:23</time>
+                  </header>
+                  <p>@Iris Designer and @Atlas Full-stack start from this direction. Keep mobile chat-first.</p>
+                </div>
+              </article>
+
+              <article class="message agent">
+                <span class="avatar design">UI</span>
+                <div class="bubble">
+                  <header>
+                    <strong>Iris Designer</strong>
+                    <time>10:25</time>
+                  </header>
+                  <p>I will make the first viewport feel like an IM app: conversation list, live chat, and contextual project resources.</p>
+                  <div class="mini-card preview">
+                    <div>
+                      <strong>Mobile layout preview</strong>
+                      <small>prototype/mobile-chat.html</small>
+                    </div>
+                    <button>Preview</button>
+                  </div>
+                </div>
+              </article>
+
+              <article class="message agent pending">
+                <span class="avatar dev">FS</span>
+                <div class="bubble">
+                  <header>
+                    <strong>Atlas Full-stack</strong>
+                    <time>thinking</time>
+                  </header>
+                  <p>Reading workspace files and preparing the implementation plan.</p>
+                  <button class="stop-button">Stop</button>
+                </div>
+              </article>
+            </div>
+
+            <form class="composer">
+              <div class="reply-context">
+                <span>Replying to Nova Product</span>
+                <button type="button">Clear</button>
+              </div>
+              <textarea rows="3" placeholder="Message @agent, @all, or @user"></textarea>
+              <div class="composer-footer">
+                <div>
+                  <button type="button">@Nova</button>
+                  <button type="button">@Iris</button>
+                  <button type="button">@Atlas</button>
+                </div>
+                <button class="send-button">Send</button>
+              </div>
+            </form>
+          </section>
+
+          <aside class="detail-panel">
+            <nav class="detail-tabs">
+              <button class="active">Room</button>
+              <button>Work</button>
+              <button>Files</button>
+            </nav>
+
+            <section class="detail-card">
+              <div class="card-heading">
+                <strong>Members</strong>
+                <small>4 agents</small>
+              </div>
+              <button class="member-row">
+                <span class="avatar product">PM</span>
+                <span>
+                  <strong>Nova Product</strong>
+                  <small>working · Product Manager</small>
+                </span>
+                <em>Edit</em>
+              </button>
+              <button class="member-row">
+                <span class="avatar design">UI</span>
+                <span>
+                  <strong>Iris Designer</strong>
+                  <small>ready · Designer</small>
+                </span>
+                <em>Edit</em>
+              </button>
+              <button class="member-row">
+                <span class="avatar dev">FS</span>
+                <span>
+                  <strong>Atlas Full-stack</strong>
+                  <small>thinking · Full-stack</small>
+                </span>
+                <em>Edit</em>
+              </button>
+            </section>
+
+            <section class="detail-card">
+              <div class="card-heading">
+                <strong>Agent Work</strong>
+                <small>Room state</small>
+              </div>
+              <div class="work-row running">
+                <span></span>
+                <div>
+                  <strong>Product brief</strong>
+                  <small>Nova Product · running</small>
+                </div>
+                <button>Stop</button>
+              </div>
+              <div class="work-row ready">
+                <span></span>
+                <div>
+                  <strong>Design pass</strong>
+                  <small>Iris Designer · ready</small>
+                </div>
+                <button>Run</button>
+              </div>
+              <div class="work-row waiting">
+                <span></span>
+                <div>
+                  <strong>Review implementation</strong>
+                  <small>after design and development</small>
+                </div>
+                <button>View</button>
+              </div>
+            </section>
+
+            <section class="detail-card">
+              <div class="card-heading">
+                <strong>Resources</strong>
+                <small>latest</small>
+              </div>
+              <button class="resource-row">
+                <span>Project</span>
+                <strong>Launch Website</strong>
+              </button>
+              <button class="resource-row">
+                <span>File</span>
+                <strong>projects/launch/index.html</strong>
+              </button>
+              <button class="resource-row">
+                <span>Preview</span>
+                <strong>Open full page</strong>
+              </button>
+            </section>
+          </aside>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,58 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      '@hono/node-server':
+        specifier: ^2.0.2
+        version: 2.0.2(hono@4.12.19)
+      hono:
+        specifier: ^4.12.19
+        version: 4.12.19
+      undici:
+        specifier: ^6.25.0
+        version: 6.25.0
+
+  apps/api:
+    dependencies:
+      '@hono/node-server':
+        specifier: ^2.0.2
+        version: 2.0.2(hono@4.12.19)
+      hono:
+        specifier: ^4.12.19
+        version: 4.12.19
+
+  apps/desktop: {}
+
+  packages/provider-sdk: {}
+
+packages:
+
+  '@hono/node-server@2.0.2':
+    resolution: {integrity: sha512-tXlTi1h/4V7sDe7i97IVP+9re9ZU7wXZZggnR5ucCRclf1+AX6YhGStrR5w8bLj+3Mlyl0pKfBh9gqTqqnGKfQ==}
+    engines: {node: '>=20'}
+    peerDependencies:
+      hono: ^4
+
+  hono@4.12.19:
+    resolution: {integrity: sha512-xa3eYXYXx68XTT4hZ7dRzsXBhaq85ToSrlUJNoR0gwz/1Ap/CNwX47wfvV7pc/xWhjKVVkLT7zBJy8chhNguqQ==}
+    engines: {node: '>=16.9.0'}
+
+  undici@6.25.0:
+    resolution: {integrity: sha512-ZgpWDC5gmNiuY9CnLVXEH8rl50xhRCuLNA97fAUnKi8RRuV4E6KG31pDTsLVUKnohJE0I3XDrTeEydAXRw47xg==}
+    engines: {node: '>=18.17'}
+
+snapshots:
+
+  '@hono/node-server@2.0.2(hono@4.12.19)':
+    dependencies:
+      hono: 4.12.19
+
+  hono@4.12.19: {}
+
+  undici@6.25.0: {}
