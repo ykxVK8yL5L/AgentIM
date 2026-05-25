@@ -32,6 +32,20 @@ const DEFAULT_ROLE_LOOKUP = new Map(DEFAULT_ROLES.map((role) => [role.id, role])
 const AUTH_COOKIE = 'agentim_session';
 const AUTH_SESSION_VALUE = 'authenticated';
 const AUTH_SECRET = process.env.AGENTIM_AUTH_SECRET ?? randomBytes(32).toString('hex');
+const WEB_READ_TIMEOUT_MS = 20000;
+const WEB_READ_MAX_BYTES = 512000;
+const WEB_READ_MAX_TEXT_CHARS = 60000;
+const GITHUB_READ_MAX_FILES = 14;
+const GITHUB_READ_MAX_FILE_CHARS = 12000;
+const CONTINUATION_PLATFORM_ACTIONS = new Set([
+  'agent.read',
+  'room.read',
+  'skill.read',
+  'project.read',
+  'artifact.read',
+  'activity.read',
+  'provider.probe'
+]);
 
 async function requiresAuth(c, store) {
   const path = new URL(c.req.url).pathname;
@@ -2339,6 +2353,7 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
   };
 
   try {
+    let providerMessages = [];
     const recentMessages = (await store.listMessages(run.roomId))
       .filter((message) => message.id !== run.messageId)
       .slice(-12)
@@ -2365,7 +2380,7 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
       const workspaceContext = await buildWorkspaceContext(store, workspaceScope.roomId, workspaceScope);
       const role = await store.getRole(agent.roleId);
       const skills = await store.listSkills();
-      const messages = [
+      providerMessages = [
         { role: 'system', content: buildAgentSystemPrompt(agent, roomAgents, workspaceContext, role, skills, workspaceScope) },
         ...recent
       ];
@@ -2381,7 +2396,7 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
         input: {
           providerId: provider.id,
           model: agent.model,
-          messageCount: messages.length,
+          messageCount: providerMessages.length,
           streaming: true
         },
         startedAt: new Date().toISOString()
@@ -2393,7 +2408,7 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
           baseUrl: provider.baseUrl,
           apiKey: provider.apiKey,
           model: agent.model,
-          messages,
+          messages: providerMessages,
           maxTokens: 800,
           signal
         }, providerDeps);
@@ -2417,7 +2432,7 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
             baseUrl: provider.baseUrl,
             apiKey: provider.apiKey,
             model: agent.model,
-            messages,
+            messages: providerMessages,
             signal
           }, providerDeps)) {
             if (signal.aborted) throw new Error('agent_run_stopped');
@@ -2453,7 +2468,7 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
             baseUrl: provider.baseUrl,
             apiKey: provider.apiKey,
             model: agent.model,
-            messages,
+            messages: providerMessages,
             maxTokens: 800,
             signal
           }, providerDeps);
@@ -2489,6 +2504,27 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
     if (signal.aborted || await isAgentRunStopped(store, run.id)) return;
 
     content = content || formatEmptyProviderResponse(providerDiagnostics);
+    const webReads = await applyWebReadActions(store, run, content, signal);
+    if (webReads.length > 0) {
+      const webReadText = formatWebReadResults(webReads);
+      content = `${content}\n\n${webReadText}`;
+      await store.updateMessage(run.messageId, {
+        content,
+        status: 'running',
+        pending: true
+      });
+      if (provider.baseUrl !== 'mock://provider') {
+        content = await continueAgentAfterToolResults(store, run, {
+          agent,
+          provider,
+          messages: providerMessages,
+          previousContent: content,
+          toolResultText: webReadText,
+          providerDiagnostics,
+          signal
+        });
+      }
+    }
     const workspaceReads = await applyWorkspaceReadActions(store, run, content, workspaceScope);
     if (workspaceReads.length > 0) {
       content = `${content}\n\n${formatWorkspaceReadResults(workspaceReads)}`;
@@ -2497,19 +2533,19 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
         status: 'running',
         pending: true
       });
+      if (provider.baseUrl !== 'mock://provider') {
+        content = await continueAgentAfterToolResults(store, run, {
+          agent,
+          provider,
+          messages: providerMessages,
+          previousContent: content,
+          toolResultText: formatWorkspaceReadResults(workspaceReads),
+          providerDiagnostics,
+          signal
+        });
+      }
     }
     const workspaceActions = await applyWorkspaceActions(store, run, content, workspaceScope);
-    await store.updateMessage(run.messageId, {
-      content,
-      status: 'done',
-      pending: false
-    });
-    await store.updateAgentRun(run.id, {
-      status: 'done',
-      completedAt: new Date().toISOString()
-    });
-    await completeScheduledTaskForRun(store, run.id, 'done');
-    await completeProjectTaskForRun(store, run, 'done', undefined, content);
     if (workspaceActions.length > 0) {
       await store.createMessage({
         roomId: run.roomId,
@@ -2553,6 +2589,50 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
         status: 'done',
         pending: false
       });
+      if (provider.baseUrl !== 'mock://provider' && platformActionsShouldContinue(platformActions)) {
+        content = await continueAgentAfterToolResults(store, run, {
+          agent,
+          provider,
+          messages: providerMessages,
+          previousContent: content,
+          toolResultText: formatPlatformActionResults(platformActions),
+          providerDiagnostics,
+          signal
+        });
+        const followupRoomMessages = await applyRoomMessageActions(store, run, content, workspaceScope);
+        if (followupRoomMessages.length > 0) {
+          await store.createMessage({
+            roomId: run.roomId,
+            senderType: 'system',
+            senderName: 'AgentIM',
+            content: `Message sent to ${followupRoomMessages.map((action) => action.roomName).join(', ')}.`,
+            status: 'done',
+            pending: false
+          });
+        }
+        const followupRoleActions = await applyRoleManagementActions(store, run, content);
+        if (followupRoleActions.created.length > 0) {
+          await store.createMessage({
+            roomId: run.roomId,
+            senderType: 'system',
+            senderName: 'AgentIM',
+            content: `Roles created: ${followupRoleActions.created.map((action) => action.roleName).join(', ')}.`,
+            status: 'done',
+            pending: false
+          });
+        }
+        const followupPlatformActions = await applyPlatformActions(store, run, content, workspaceScope);
+        if (followupPlatformActions.length > 0) {
+          await store.createMessage({
+            roomId: run.roomId,
+            senderType: 'system',
+            senderName: 'AgentIM',
+            content: `Platform actions completed: ${followupPlatformActions.map((action) => action.summary).join('; ')}.`,
+            status: 'done',
+            pending: false
+          });
+        }
+      }
     }
     const roomManagementActions = await applyRoomManagementActions(store, run, content, workspaceScope);
     if (roomManagementActions.created.length > 0 || roomManagementActions.assigned.length > 0) {
@@ -2571,6 +2651,17 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
       });
     }
 
+    await store.updateMessage(run.messageId, {
+      content,
+      status: 'done',
+      pending: false
+    });
+    await store.updateAgentRun(run.id, {
+      status: 'done',
+      completedAt: new Date().toISOString()
+    });
+    await completeScheduledTaskForRun(store, run.id, 'done');
+    await completeProjectTaskForRun(store, run, 'done', undefined, content);
     await startMentionedAgentRuns(store, run, content);
   } catch (error) {
     if ((signal.aborted && running?.abortReason === AGENT_RUN_ABORT_STOP) || error?.message === 'agent_run_stopped') {
@@ -2628,6 +2719,128 @@ async function clearStaleProviderInvocations(store, run) {
       completedAt: new Date().toISOString()
     });
   }
+}
+
+async function continueAgentAfterToolResults(store, run, options) {
+  const {
+    agent,
+    provider,
+    messages,
+    previousContent,
+    toolResultText,
+    providerDiagnostics,
+    signal
+  } = options;
+  if (!Array.isArray(messages) || messages.length === 0) return previousContent;
+  const continuationMessages = [
+    ...messages,
+    { role: 'assistant', content: previousContent },
+    {
+      role: 'user',
+      content: [
+        'The platform executed the requested action and returned these results:',
+        truncateToolResultText(toolResultText),
+        '',
+        'Continue the original user request now. Use the results above to produce the final answer or emit the next controlled action block if one is required. Do not stop after merely reading data.'
+      ].join('\n')
+    }
+  ];
+  const invocation = await store.createSkillInvocation({
+    skillId: 'provider.chat',
+    roomId: run.roomId,
+    runId: run.id,
+    messageId: run.messageId,
+    agentId: agent.id,
+    actorType: 'agent',
+    status: 'running',
+    input: {
+      providerId: provider.id,
+      model: agent.model,
+      messageCount: continuationMessages.length,
+      streaming: false,
+      continuation: true
+    },
+    startedAt: new Date().toISOString()
+  });
+  try {
+    const result = await createOpenAICompatibleChat({
+      baseUrl: provider.baseUrl,
+      apiKey: provider.apiKey,
+      model: agent.model,
+      messages: continuationMessages,
+      maxTokens: 1000,
+      signal
+    }, await createProviderDeps(store));
+    const nextContent = result.content || previousContent;
+    Object.assign(providerDiagnostics, {
+      continuationUsed: true,
+      continuationFinishReason: result.finishReason ?? '',
+      continuationUsage: result.usage ?? null,
+      continuationResponse: result.response ?? null
+    });
+    await store.updateSkillInvocation(invocation.id, {
+      status: 'done',
+      output: {
+        model: result.model ?? agent.model,
+        contentLength: nextContent.length,
+        diagnostics: {
+          finishReason: result.finishReason ?? '',
+          usage: result.usage ?? null,
+          response: result.response ?? null
+        }
+      },
+      completedAt: new Date().toISOString()
+    });
+    await store.updateMessage(run.messageId, {
+      content: nextContent,
+      status: 'running',
+      pending: true
+    });
+    return nextContent;
+  } catch (error) {
+    await store.updateSkillInvocation(invocation.id, {
+      status: signal.aborted || error?.message === 'agent_run_stopped' ? 'rejected' : 'failed',
+      error: error instanceof Error ? error.message : String(error),
+      output: {
+        diagnostics: {
+          response: error?.response ?? null
+        }
+      },
+      completedAt: new Date().toISOString()
+    });
+    throw error;
+  }
+}
+
+function platformActionsShouldContinue(actions) {
+  return actions.some((action) => CONTINUATION_PLATFORM_ACTIONS.has(action.action));
+}
+
+function formatPlatformActionResults(actions) {
+  return actions.map((action) => [
+    `Platform action result: ${action.action}`,
+    `Summary: ${action.summary}`,
+    'Output:',
+    '```json',
+    safeStringifyForPrompt(action.output),
+    '```'
+  ].join('\n')).join('\n\n');
+}
+
+function truncateToolResultText(value) {
+  const text = String(value ?? '');
+  const maxChars = 24000;
+  return text.length > maxChars ? `${text.slice(0, maxChars)}\n...[truncated]` : text;
+}
+
+function safeStringifyForPrompt(value) {
+  return truncateToolResultText(JSON.stringify(value, jsonPromptReplacer, 2));
+}
+
+function jsonPromptReplacer(key, value) {
+  if (key === 'apiKey' || key === 'passwordHash' || key === 'passwordSalt' || key === 'passwordSecret') return '[redacted]';
+  if (typeof value === 'string' && value.length > 2000) return `${value.slice(0, 2000)}...[truncated]`;
+  return value;
 }
 
 async function startMentionedAgentRuns(store, run, content) {
@@ -2756,6 +2969,340 @@ function stopRunningAgentRun(runId) {
 function abortAgentRun(running, reason) {
   running.abortReason = reason;
   running.controller.abort();
+}
+
+async function applyWebReadActions(store, run, content, signal) {
+  const requests = parseWebReadBlocks(content);
+  if (requests.length === 0) return [];
+
+  const agent = await store.getAgent(run.agentId);
+  const skills = await store.listSkills();
+  if (!await agentHasSkill(store, agent, 'web.read', skills)) {
+    throw new Error('agent_missing_web_read_skill');
+  }
+
+  const results = [];
+  for (const request of requests) {
+    const invocation = await store.createSkillInvocation({
+      skillId: 'web.read',
+      roomId: run.roomId,
+      runId: run.id,
+      messageId: run.messageId,
+      agentId: run.agentId,
+      actorType: 'agent',
+      status: 'running',
+      input: request,
+      startedAt: new Date().toISOString()
+    });
+    try {
+      const result = await readWebUrl(request.url, {
+        maxFiles: request.maxFiles,
+        signal
+      });
+      results.push(result);
+      await store.updateSkillInvocation(invocation.id, {
+        status: 'done',
+        output: webReadInvocationOutput(result),
+        completedAt: new Date().toISOString()
+      });
+    } catch (error) {
+      await store.updateSkillInvocation(invocation.id, {
+        status: 'failed',
+        error: error instanceof Error ? error.message : String(error),
+        completedAt: new Date().toISOString()
+      });
+      throw error;
+    }
+  }
+  return results;
+}
+
+async function readWebUrl(rawUrl, options = {}) {
+  const url = normalizeWebReadUrl(rawUrl);
+  const githubRepo = parseGitHubRepoUrl(url);
+  if (githubRepo) return readGitHubRepository(githubRepo, options);
+  return readGenericWebPage(url, options);
+}
+
+async function readGenericWebPage(url, options = {}) {
+  const response = await fetchWithTimeout(url.href, {
+    signal: options.signal,
+    headers: {
+      accept: 'text/html,text/plain,application/json;q=0.9,*/*;q=0.5',
+      'user-agent': 'AgentIM web.read'
+    }
+  });
+  const contentType = response.headers.get('content-type') ?? '';
+  const raw = await readResponseTextLimited(response, WEB_READ_MAX_BYTES);
+  return {
+    type: 'web_page',
+    url: url.href,
+    status: response.status,
+    statusText: response.statusText,
+    contentType,
+    title: extractHtmlTitle(raw),
+    text: truncateWebText(contentType.includes('html') ? htmlToText(raw) : raw),
+    truncated: raw.length >= WEB_READ_MAX_BYTES
+  };
+}
+
+async function readGitHubRepository(repo, options = {}) {
+  const headers = {
+    accept: 'application/vnd.github+json',
+    'user-agent': 'AgentIM web.read'
+  };
+  const apiBase = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}`;
+  const repoResponse = await fetchJsonWithTimeout(apiBase, { headers, signal: options.signal });
+  const branch = repo.ref || repoResponse.default_branch || 'main';
+  const treeResponse = await fetchJsonWithTimeout(`${apiBase}/git/trees/${encodeURIComponent(branch)}?recursive=1`, {
+    headers,
+    signal: options.signal
+  });
+  const tree = Array.isArray(treeResponse.tree) ? treeResponse.tree : [];
+  const files = tree
+    .filter((item) => item.type === 'blob' && isUsefulRepositoryFile(item.path, item.size))
+    .sort(compareRepositoryFiles);
+  const selectedFiles = selectRepositoryFiles(files, options.maxFiles);
+  const fileContents = [];
+  for (const file of selectedFiles) {
+    try {
+      const rawUrl = `https://raw.githubusercontent.com/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}/${encodeURIComponent(branch)}/${file.path.split('/').map(encodeURIComponent).join('/')}`;
+      const response = await fetchWithTimeout(rawUrl, {
+        signal: options.signal,
+        headers: { 'user-agent': 'AgentIM web.read' }
+      });
+      const raw = await readResponseTextLimited(response, GITHUB_READ_MAX_FILE_CHARS * 2);
+      fileContents.push({
+        path: file.path,
+        size: file.size ?? raw.length,
+        content: truncateGitHubFile(raw),
+        truncated: raw.length > GITHUB_READ_MAX_FILE_CHARS
+      });
+    } catch (error) {
+      fileContents.push({
+        path: file.path,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+  return {
+    type: 'github_repository',
+    url: repo.url.href,
+    owner: repo.owner,
+    name: repo.name,
+    branch,
+    description: repoResponse.description ?? '',
+    language: repoResponse.language ?? '',
+    stars: repoResponse.stargazers_count ?? 0,
+    defaultBranch: repoResponse.default_branch ?? branch,
+    fileCount: files.length,
+    files: fileContents
+  };
+}
+
+function webReadInvocationOutput(result) {
+  if (result.type === 'github_repository') {
+    return {
+      type: result.type,
+      url: result.url,
+      repo: `${result.owner}/${result.name}`,
+      branch: result.branch,
+      fileCount: result.fileCount,
+      returnedFiles: result.files.map((file) => ({
+        path: file.path,
+        size: file.size,
+        truncated: file.truncated,
+        error: file.error
+      }))
+    };
+  }
+  return {
+    type: result.type,
+    url: result.url,
+    status: result.status,
+    contentType: result.contentType,
+    title: result.title,
+    textLength: result.text.length,
+    truncated: result.truncated
+  };
+}
+
+function normalizeWebReadUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(String(rawUrl ?? '').trim());
+  } catch {
+    throw new Error('invalid_web_url');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('web_read_url_must_be_http_or_https');
+  }
+  if (isLocalWebHost(parsed.hostname)) {
+    throw new Error('web_read_localhost_not_allowed');
+  }
+  parsed.hash = '';
+  return parsed;
+}
+
+function isLocalWebHost(hostname) {
+  const host = String(hostname ?? '').toLowerCase();
+  return host === 'localhost'
+    || host === '127.0.0.1'
+    || host === '0.0.0.0'
+    || host === '::1'
+    || host.endsWith('.local');
+}
+
+function parseGitHubRepoUrl(url) {
+  if (url.hostname.toLowerCase() !== 'github.com') return null;
+  const parts = url.pathname.split('/').filter(Boolean);
+  if (parts.length < 2) return null;
+  if (['blob', 'tree', 'issues', 'pulls', 'commit', 'releases'].includes(parts[2])) {
+    return {
+      url,
+      owner: parts[0],
+      name: stripGitSuffix(parts[1]),
+      ref: parts[3] || ''
+    };
+  }
+  return {
+    url,
+    owner: parts[0],
+    name: stripGitSuffix(parts[1]),
+    ref: ''
+  };
+}
+
+function stripGitSuffix(value) {
+  return String(value ?? '').replace(/\.git$/i, '');
+}
+
+async function fetchJsonWithTimeout(url, init = {}) {
+  const response = await fetchWithTimeout(url, init);
+  if (!response.ok) throw new Error(`web_read_http_${response.status}`);
+  return response.json();
+}
+
+async function fetchWithTimeout(url, init = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), WEB_READ_TIMEOUT_MS);
+  const signal = mergeAbortSignals(init.signal, controller.signal);
+  try {
+    const response = await fetch(url, {
+      ...init,
+      redirect: 'follow',
+      signal
+    });
+    if (!response.ok) throw new Error(`web_read_http_${response.status}`);
+    return response;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function mergeAbortSignals(...signals) {
+  const activeSignals = signals.filter(Boolean);
+  if (activeSignals.length === 0) return undefined;
+  if (activeSignals.length === 1) return activeSignals[0];
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  for (const signal of activeSignals) {
+    if (signal.aborted) {
+      controller.abort();
+      break;
+    }
+    signal.addEventListener('abort', abort, { once: true });
+  }
+  return controller.signal;
+}
+
+async function readResponseTextLimited(response, maxBytes) {
+  const reader = response.body?.getReader();
+  if (!reader) return '';
+  const chunks = [];
+  let bytes = 0;
+  while (bytes < maxBytes) {
+    const { done, value } = await reader.read();
+    if (done || !value) break;
+    const next = value.slice(0, Math.max(maxBytes - bytes, 0));
+    chunks.push(next);
+    bytes += next.byteLength;
+    if (value.byteLength > next.byteLength) break;
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+function extractHtmlTitle(html) {
+  return decodeHtmlEntities(String(html ?? '').match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] ?? '').trim();
+}
+
+function htmlToText(html) {
+  return decodeHtmlEntities(String(html ?? '')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<\/(p|div|section|article|header|footer|li|h[1-6]|tr)>/gi, '\n')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/[ \t\r\f\v]+/g, ' ')
+    .replace(/\n\s+/g, '\n')
+    .replace(/\n{3,}/g, '\n\n'))
+    .trim();
+}
+
+function decodeHtmlEntities(value) {
+  return String(value ?? '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([a-f0-9]+);/gi, (_, code) => String.fromCodePoint(Number.parseInt(code, 16)));
+}
+
+function truncateWebText(value) {
+  const text = String(value ?? '').trim();
+  return text.length > WEB_READ_MAX_TEXT_CHARS ? `${text.slice(0, WEB_READ_MAX_TEXT_CHARS)}\n...[truncated]` : text;
+}
+
+function isUsefulRepositoryFile(path, size = 0) {
+  const normalized = String(path ?? '');
+  if (!normalized || normalized.includes('/.git/') || normalized.includes('/node_modules/') || normalized.includes('/dist/') || normalized.includes('/build/')) return false;
+  if (Number(size) > 200000) return false;
+  const lower = normalized.toLowerCase();
+  if (lower.includes('package-lock.json') || lower.includes('pnpm-lock.yaml') || lower.includes('yarn.lock')) return false;
+  if (/\.(png|jpe?g|gif|webp|ico|pdf|zip|gz|tar|mp4|mov|woff2?|ttf|otf)$/i.test(lower)) return false;
+  return isPriorityRepositoryFile(normalized) || /\.(md|txt|json|js|jsx|ts|tsx|css|scss|html|py|go|rs|java|kt|swift|rb|php|cs|yml|yaml|toml|xml|sql)$/i.test(lower);
+}
+
+function isPriorityRepositoryFile(path) {
+  return /(^|\/)(readme|package|vite\.config|next\.config|tailwind\.config|tsconfig|src\/index|src\/app|src\/main|src\/App|app\/page|pages\/index|components\/)/i.test(path);
+}
+
+function compareRepositoryFiles(a, b) {
+  const score = (file) => {
+    const path = String(file.path ?? '');
+    if (/readme/i.test(path)) return 0;
+    if (/package\.json$/i.test(path)) return 1;
+    if (/src\/(app|main|index|App)\./.test(path)) return 2;
+    if (/app\/page\./.test(path) || /pages\/index\./.test(path)) return 3;
+    if (/components\//.test(path)) return 4;
+    return 10 + path.split('/').length;
+  };
+  return score(a) - score(b) || String(a.path).localeCompare(String(b.path));
+}
+
+function selectRepositoryFiles(files, maxFiles) {
+  const limit = Math.min(Math.max(Number(maxFiles) || GITHUB_READ_MAX_FILES, 1), 24);
+  return files.slice(0, limit);
+}
+
+function truncateGitHubFile(value) {
+  const text = String(value ?? '');
+  return text.length > GITHUB_READ_MAX_FILE_CHARS ? `${text.slice(0, GITHUB_READ_MAX_FILE_CHARS)}\n...[truncated]` : text;
 }
 
 async function applyWorkspaceReadActions(store, run, content, workspaceScope) {
@@ -3203,7 +3750,7 @@ async function applyPlatformActions(store, run, content, workspaceScope) {
         output: result.output,
         completedAt: new Date().toISOString()
       });
-      results.push({ action: request.action, summary: result.summary });
+      results.push({ action: request.action, summary: result.summary, output: result.output });
     } catch (error) {
       await store.updateSkillInvocation(invocation.id, {
         status: 'failed',
@@ -3863,6 +4410,42 @@ function parseWorkspaceActionBlocks(content) {
   return blocks.slice(0, 32);
 }
 
+function parseWebReadBlocks(content) {
+  const blocks = [];
+  const pattern = /```agentim-web-read\s*\n([\s\S]*?)```/g;
+  for (const match of String(content ?? '').matchAll(pattern)) {
+    const payload = parseJsonBlock(match[1]);
+    if (!payload) continue;
+    const url = String(payload.url ?? '').trim();
+    if (!url) continue;
+    blocks.push({
+      url,
+      maxFiles: Number(payload.maxFiles) || undefined
+    });
+  }
+
+  const inlinePattern = /```agentim-web-read\s+url=(?:"([^"]+)"|'([^']+)'|([^\s`]+))(?:\s+maxFiles=(\d+))?\s*```/g;
+  for (const match of String(content ?? '').matchAll(inlinePattern)) {
+    const url = String(match[1] ?? match[2] ?? match[3] ?? '').trim();
+    if (!url) continue;
+    blocks.push({
+      url,
+      maxFiles: Number(match[4]) || undefined
+    });
+  }
+  return dedupeWebReadBlocks(blocks).slice(0, 4);
+}
+
+function dedupeWebReadBlocks(blocks) {
+  const seen = new Set();
+  return blocks.filter((block) => {
+    const key = block.url;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function parseWorkspaceReadBlocks(content) {
   const blocks = [];
   const readPattern = /```agentim-read-file\s+path=(?:"([^"]+)"|'([^']+)'|([^\s`]+))\s*```/g;
@@ -3883,6 +4466,34 @@ function parseWorkspaceReadBlocks(content) {
     });
   }
   return blocks.slice(0, 16);
+}
+
+function formatWebReadResults(results) {
+  return results.map((result) => {
+    if (result.type === 'github_repository') {
+      return [
+        `Web read result for GitHub repository ${result.owner}/${result.name} (${result.branch}):`,
+        result.description ? `Description: ${result.description}` : '',
+        result.language ? `Primary language: ${result.language}` : '',
+        `Repository files considered: ${result.fileCount}`,
+        '',
+        ...result.files.map((file) => [
+          `File: ${file.path}${file.truncated ? ' (truncated)' : ''}`,
+          file.error ? `Error: ${file.error}` : '```',
+          file.error ? '' : file.content,
+          file.error ? '' : '```'
+        ].filter(Boolean).join('\n'))
+      ].filter(Boolean).join('\n');
+    }
+    return [
+      `Web read result for ${result.url}:`,
+      result.title ? `Title: ${result.title}` : '',
+      `HTTP: ${result.status} ${result.statusText ?? ''}`.trim(),
+      result.contentType ? `Content-Type: ${result.contentType}` : '',
+      '',
+      result.text
+    ].filter(Boolean).join('\n');
+  }).join('\n\n');
 }
 
 function truncateWorkspaceReadContent(content) {
@@ -4544,6 +5155,9 @@ function buildAgentSystemPrompt(agent, roomAgents, workspaceContext = '', role, 
     ? `\n\nYou can create a custom Agent role by emitting this controlled JSON block:\n\`\`\`agentim-role-create\n{"name":"Role name","description":"What this role is for","systemPrompt":"Instructions for Agents assigned to this role.","skillIds":["provider.chat","workspace.read","agent.message"]}\n\`\`\`\nUse this when existing roles do not fit the user's requested specialization. Use only existing skill ids; unavailable skill ids will be ignored. Do not claim a role was created unless you emitted the block.`
     : '\n\nYou do not have role.create enabled. Do not claim to create roles.';
   const platformActions = buildPlatformActionPrompt(skillSet);
+  const webRead = skillSet.has('web.read')
+    ? `\n\nYou can read public web pages and public GitHub repositories by emitting a controlled block:\n\`\`\`agentim-web-read\n{"url":"https://example.com","maxFiles":12}\n\`\`\`\nUse web.read when the user gives you a URL, asks you to inspect external docs/code, or asks you to analyze a GitHub project before applying ideas to this workspace. For GitHub repository URLs, the platform returns repository metadata, file tree highlights, README/package files, and selected source files. After reading, continue the user's original task using the returned content.`
+    : '\n\nYou do not have web.read enabled. Do not claim to open URLs, browse websites, or inspect GitHub links.';
   const workspaceRead = skillSet.has('workspace.read')
     ? `\n\nYou can inspect the ${workspaceScope?.isExternal ? `target room workspace (${workspaceScope.room.name})` : 'current room workspace'} by emitting controlled fenced blocks.\n\nList a directory:\n\`\`\`agentim-list-dir path=\"relative/dir\"\`\`\`\nUse an empty path to list the workspace root:\n\`\`\`agentim-list-dir path=\"\"\`\`\`\n\nRead a file:\n\`\`\`agentim-read-file path=\"relative/path.txt\"\`\`\`\n\nUse these read blocks when you need file contents before answering or editing.`
     : '\n\nYou do not have workspace.read enabled. Do not claim to read workspace files.';
@@ -4566,7 +5180,7 @@ function buildAgentSystemPrompt(agent, roomAgents, workspaceContext = '', role, 
   const userApproval = skillSet.has('user.request_approval')
     ? `\n\nWhen you need an explicit user decision, emit a controlled approval request block:\n\`\`\`agentim-approval-request\n{\n  "title": "Decision title",\n  "reason": "Why approval is needed",\n  "approveLabel": "Approve",\n  "rejectLabel": "Reject",\n  "details": ["optional detail"]\n}\n\`\`\`\nUse this for risky, costly, ambiguous, or user-owned decisions.`
     : '\n\nYou do not have user.request_approval enabled. Mention @user in plain text for decisions instead.';
-  return `${legacyAgentPrompt}${rolePrompt}${collaboration}\n\nThe human user is @user. Mention @user when you need confirmation, missing requirements, or a decision from the user. @user is not an automated Agent.${approvalGuidance}${skills}${roleDirectory}${roleCreate}${platformActions}${workspace}${workspaceRead}${workspaceWrite}${roomMessaging}${roomCreate}${roomAssign}${taskPlanning}${userApproval}`;
+  return `${legacyAgentPrompt}${rolePrompt}${collaboration}\n\nThe human user is @user. Mention @user when you need confirmation, missing requirements, or a decision from the user. @user is not an automated Agent.${approvalGuidance}${skills}${roleDirectory}${roleCreate}${platformActions}${webRead}${workspace}${workspaceRead}${workspaceWrite}${roomMessaging}${roomCreate}${roomAssign}${taskPlanning}${userApproval}`;
 }
 
 function formatRoleDirectory() {

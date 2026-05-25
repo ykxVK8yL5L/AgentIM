@@ -82,6 +82,24 @@ export const DEFAULT_SKILLS = [
     description: 'Package workspace files into downloadable artifacts.'
   },
   {
+    id: 'web.read',
+    name: 'Web Read',
+    version: '1.0.0',
+    category: 'research',
+    common: true,
+    installed: true,
+    enabled: true,
+    source: 'system',
+    runtime: { kind: 'server', adapter: 'agentim.web' },
+    inputSchema: { type: 'object' },
+    outputSchema: { type: 'object' },
+    policy: { workspace: 'none', network: true, destructive: false },
+    ui: { card: 'message' },
+    riskLevel: 'medium',
+    requiresApproval: false,
+    description: 'Read public web pages and public GitHub repositories for research and code analysis.'
+  },
+  {
     id: 'artifact.card',
     name: 'Artifact Cards',
     version: '1.0.0',
@@ -756,6 +774,7 @@ export const STANDARD_ROLE_SKILL_IDS = [
   'workspace.write',
   'workspace.preview',
   'workspace.export',
+  'web.read',
   'artifact.card',
   'agent.message',
   'role.read',
@@ -792,7 +811,7 @@ export const DEFAULT_ROLES = [
     name: 'Product Manager',
     description: 'Turns user intent into plans, acceptance criteria, and coordinated room work.',
     systemPrompt: 'You are a product manager Agent. Clarify goals, break work into practical plans, define acceptance criteria, and coordinate other Agents when useful.',
-    skillIds: ['provider.chat', 'workspace.read', 'artifact.card', 'agent.message', 'role.read', 'role.create', 'role.update', 'agent.read', 'agent.create', 'agent.update', 'agent.test', 'room.read', 'room.create', 'room.assign', 'room.update', 'skill.read', 'task.run', 'task.cancel', 'project.read', 'project.create', 'artifact.read', 'activity.read', 'user.notify'],
+    skillIds: ['provider.chat', 'workspace.read', 'web.read', 'artifact.card', 'agent.message', 'role.read', 'role.create', 'role.update', 'agent.read', 'agent.create', 'agent.update', 'agent.test', 'room.read', 'room.create', 'room.assign', 'room.update', 'skill.read', 'task.run', 'task.cancel', 'project.read', 'project.create', 'artifact.read', 'activity.read', 'user.notify'],
     system: true
   },
   {
@@ -800,7 +819,7 @@ export const DEFAULT_ROLES = [
     name: 'Designer',
     description: 'Creates and critiques UI concepts, visual artifacts, and previewable design widgets.',
     systemPrompt: 'You are a designer Agent. Create thoughtful UI, interaction, visual direction, and previewable artifacts that fit the product context.',
-    skillIds: ['provider.chat', 'workspace.read', 'workspace.write', 'workspace.preview', 'artifact.card', 'user.notify'],
+    skillIds: ['provider.chat', 'workspace.read', 'web.read', 'workspace.write', 'workspace.preview', 'artifact.card', 'user.notify'],
     system: true
   },
   {
@@ -808,7 +827,7 @@ export const DEFAULT_ROLES = [
     name: 'Full-stack Developer',
     description: 'Builds and modifies application code, workspace files, and downloadable artifacts.',
     systemPrompt: 'You are a full-stack developer Agent. Build, debug, and improve working software while keeping changes scoped and verifiable.',
-    skillIds: ['provider.chat', 'workspace.read', 'workspace.write', 'workspace.preview', 'workspace.export', 'artifact.card', 'agent.message', 'user.notify'],
+    skillIds: ['provider.chat', 'workspace.read', 'web.read', 'workspace.write', 'workspace.preview', 'workspace.export', 'artifact.card', 'agent.message', 'user.notify'],
     system: true
   },
   {
@@ -816,7 +835,7 @@ export const DEFAULT_ROLES = [
     name: 'Reviewer',
     description: 'Reviews work for correctness, risk, missing tests, and product fit.',
     systemPrompt: 'You are a reviewer Agent. Prioritize bugs, risks, regressions, missing tests, and concrete improvement recommendations.',
-    skillIds: ['provider.chat', 'workspace.read', 'workspace.preview', 'artifact.card', 'agent.message', 'user.notify'],
+    skillIds: ['provider.chat', 'workspace.read', 'web.read', 'workspace.preview', 'artifact.card', 'agent.message', 'user.notify'],
     system: true
   }
 ];
