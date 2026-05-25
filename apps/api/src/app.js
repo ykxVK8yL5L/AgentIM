@@ -2442,6 +2442,22 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
         pending: false
       });
     }
+    const roomManagementActions = await applyRoomManagementActions(store, run, finalContent, workspaceScope);
+    if (roomManagementActions.created.length > 0 || roomManagementActions.assigned.length > 0) {
+      const created = roomManagementActions.created.map((action) => action.roomName).join(', ');
+      const assigned = roomManagementActions.assigned.map((action) => `${action.agentName} -> ${action.roomName}`).join(', ');
+      await store.createMessage({
+        roomId: run.roomId,
+        senderType: 'system',
+        senderName: 'AgentIM',
+        content: [
+          created ? `Rooms created: ${created}` : '',
+          assigned ? `Agents assigned: ${assigned}` : ''
+        ].filter(Boolean).join('\n'),
+        status: 'done',
+        pending: false
+      });
+    }
 
     await startMentionedAgentRuns(store, run, finalContent);
   } catch (error) {
@@ -2916,6 +2932,160 @@ async function createRoomMessageInvocation(store, run, input) {
   });
 }
 
+async function applyRoomManagementActions(store, run, content, workspaceScope) {
+  const createRequests = parseRoomCreateBlocks(content);
+  const assignRequests = parseRoomAssignBlocks(content);
+  if (createRequests.length === 0 && assignRequests.length === 0) {
+    return { created: [], assigned: [] };
+  }
+
+  const agent = await store.getAgent(run.agentId);
+  const skills = await store.listSkills();
+  const created = [];
+  const assigned = [];
+
+  if (createRequests.length > 0 && !await agentHasSkill(store, agent, 'room.create', skills)) {
+    throw new Error('agent_missing_room_create_skill');
+  }
+  if (assignRequests.length > 0 && !await agentHasSkill(store, agent, 'room.assign', skills)) {
+    throw new Error('agent_missing_room_assign_skill');
+  }
+
+  for (const request of createRequests) {
+    const invocation = await createRoomManagementInvocation(store, run, 'room.create', {
+      action: 'create_room',
+      request
+    });
+    try {
+      const room = await store.createRoom({
+        name: request.name,
+        type: request.type || 'group',
+        description: request.description
+      });
+      const agents = await resolveRoomManagementAgents(store, request.agents);
+      const joins = [];
+      for (const targetAgent of uniqueAgents([agent, ...agents]).filter(Boolean)) {
+        const join = await store.attachAgentToRoom(room.id, targetAgent.id, { triggerMode: 'manual' });
+        joins.push({ agent: targetAgent, join });
+      }
+      await store.getOrCreateRoomWorkspace(room.id, {
+        name: `${room.name} Workspace`
+      });
+      await store.updateSkillInvocation(invocation.id, {
+        status: 'done',
+        output: {
+          roomId: room.id,
+          roomName: room.name,
+          agents: joins.map(({ agent }) => ({ id: agent.id, name: agent.name }))
+        },
+        completedAt: new Date().toISOString()
+      });
+      created.push({
+        roomId: room.id,
+        roomName: room.name,
+        agentNames: joins.map(({ agent }) => agent.name)
+      });
+    } catch (error) {
+      await store.updateSkillInvocation(invocation.id, {
+        status: 'failed',
+        error: error instanceof Error ? error.message : String(error),
+        completedAt: new Date().toISOString()
+      });
+      throw error;
+    }
+  }
+
+  for (const request of assignRequests) {
+    const invocation = await createRoomManagementInvocation(store, run, 'room.assign', {
+      action: 'assign_agent',
+      request
+    });
+    try {
+      const room = await resolveRoomManagementRoom(store, request.room, workspaceScope);
+      if (!room) throw new Error(`room_assign_target_not_found:${request.room}`);
+      if (!await agentCanManageRoom(store, run.agentId, room.id)) {
+        throw new Error(`agent_not_member_of_room:${room.name}`);
+      }
+      const agents = await resolveRoomManagementAgents(store, request.agents);
+      if (agents.length === 0) throw new Error('room_assign_agents_required');
+      const joins = [];
+      for (const targetAgent of agents) {
+        const join = await store.attachAgentToRoom(room.id, targetAgent.id, { triggerMode: request.triggerMode || 'manual' });
+        joins.push({ agent: targetAgent, join });
+        assigned.push({
+          roomId: room.id,
+          roomName: room.name,
+          agentId: targetAgent.id,
+          agentName: targetAgent.name
+        });
+      }
+      await store.updateSkillInvocation(invocation.id, {
+        status: 'done',
+        output: {
+          roomId: room.id,
+          roomName: room.name,
+          agents: joins.map(({ agent }) => ({ id: agent.id, name: agent.name }))
+        },
+        completedAt: new Date().toISOString()
+      });
+    } catch (error) {
+      await store.updateSkillInvocation(invocation.id, {
+        status: 'failed',
+        error: error instanceof Error ? error.message : String(error),
+        completedAt: new Date().toISOString()
+      });
+      throw error;
+    }
+  }
+
+  return { created, assigned };
+}
+
+async function createRoomManagementInvocation(store, run, skillId, input) {
+  return store.createSkillInvocation({
+    skillId,
+    roomId: run.roomId,
+    runId: run.id,
+    messageId: run.messageId,
+    agentId: run.agentId,
+    actorType: 'agent',
+    status: 'running',
+    input,
+    startedAt: new Date().toISOString()
+  });
+}
+
+async function resolveRoomManagementRoom(store, requestedRoom, workspaceScope) {
+  const requested = String(requestedRoom ?? '').trim();
+  if (!requested && workspaceScope?.isExternal) return workspaceScope.room;
+  if (!requested) return null;
+  const rooms = await store.listRooms();
+  return rooms.find((room) => room.id === requested)
+    ?? rooms.find((room) => roomNameMatches(room.name, requested))
+    ?? null;
+}
+
+async function resolveRoomManagementAgents(store, agentRefs) {
+  const refs = Array.isArray(agentRefs) ? agentRefs : [];
+  if (refs.length === 0) return [];
+  const agents = await store.listAgents();
+  return uniqueAgents(refs
+    .map((ref) => {
+      const requested = String(ref ?? '').trim();
+      if (!requested) return null;
+      return agents.find((agent) => agent.id === requested)
+        ?? agents.find((agent) => roomNameMatches(agent.name, requested))
+        ?? null;
+    })
+    .filter(Boolean));
+}
+
+async function agentCanManageRoom(store, agentId, roomId) {
+  if (!agentId || !roomId) return false;
+  const members = await store.listRoomAgents(roomId);
+  return members.some((member) => member.id === agentId);
+}
+
 function buildCrossRoomMessageContent({ agentName, sourceRoomName, targetRoomName, content }) {
   return [
     `[agentim-room-message source="${escapeInlineAttribute(sourceRoomName)}" target="${escapeInlineAttribute(targetRoomName)}" agent="${escapeInlineAttribute(agentName)}"]`,
@@ -3032,10 +3202,60 @@ function parseRoomMessageBlocks(content) {
   return blocks.slice(0, 16);
 }
 
+function parseRoomCreateBlocks(content) {
+  const blocks = [];
+  const pattern = /```agentim-room-create\s*\n([\s\S]*?)```/g;
+  for (const match of String(content ?? '').matchAll(pattern)) {
+    const payload = parseJsonBlock(match[1]);
+    if (!payload) continue;
+    const name = String(payload.name ?? '').trim();
+    if (!name) continue;
+    blocks.push({
+      name,
+      description: String(payload.description ?? '').trim(),
+      type: ['group', 'dm'].includes(payload.type) ? payload.type : 'group',
+      agents: normalizeStringList(payload.agents ?? payload.agentIds ?? payload.agentNames).slice(0, 16)
+    });
+  }
+  return blocks.slice(0, 8);
+}
+
+function parseRoomAssignBlocks(content) {
+  const blocks = [];
+  const pattern = /```agentim-room-assign\s*\n([\s\S]*?)```/g;
+  for (const match of String(content ?? '').matchAll(pattern)) {
+    const payload = parseJsonBlock(match[1]);
+    if (!payload) continue;
+    const room = String(payload.room ?? payload.roomId ?? payload.roomName ?? '').trim();
+    const agents = normalizeStringList(payload.agents ?? payload.agentIds ?? payload.agentNames).slice(0, 16);
+    if (!room || agents.length === 0) continue;
+    blocks.push({
+      room,
+      agents,
+      triggerMode: String(payload.triggerMode ?? 'manual').trim() || 'manual'
+    });
+  }
+  return blocks.slice(0, 16);
+}
+
+function parseJsonBlock(value) {
+  try {
+    const parsed = JSON.parse(String(value ?? '').trim());
+    return isPlainObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 function parseInlineAttribute(header, name) {
   const pattern = new RegExp(`(?:^|\\s)${name}=(?:"([^"]*)"|'([^']*)'|(\\S+))`);
   const match = String(header ?? '').match(pattern);
   return String(match?.[1] ?? match?.[2] ?? match?.[3] ?? '').trim();
+}
+
+function normalizeStringList(value) {
+  const list = Array.isArray(value) ? value : String(value ?? '').split(',');
+  return list.map((item) => String(item ?? '').trim()).filter(Boolean);
 }
 
 function stripParsedInlineAttributes(header, names) {
@@ -3425,6 +3645,10 @@ async function* mockAgentStream(agent, recent, signal) {
     .trim() ?? 'Product Room';
   const baseText = last.toLowerCase().includes('workspace write block')
     ? `${agent.name}: mock workspace write requested.\n\n\`\`\`agentim-write-file path="hello-web/index.html"\nhello from mock\n\`\`\``
+    : last.toLowerCase().includes('room create block')
+      ? `${agent.name}: mock room create requested.\n\n\`\`\`agentim-room-create\n{"name":"Mock Managed Room","description":"Created by mock AgentIM room management flow","agents":["Helper Agent"]}\n\`\`\``
+    : last.toLowerCase().includes('room assign block')
+      ? `${agent.name}: mock room assign requested.\n\n\`\`\`agentim-room-assign\n{"room":"Product Room","agents":["Helper Agent"],"triggerMode":"manual"}\n\`\`\``
     : last.toLowerCase().includes('room message to')
       ? `${agent.name}: mock inline room message requested.\n\n\`\`\`agentim-room-message room="${inlineRoomMessageTarget}" @user inline cross-room smoke delivered\n\`\`\``
     : `${agent.name}: I received your message. The hosted Agent path is wired up, and this mock reply will switch to your OpenAI-compatible provider once the saved endpoint and key are valid.\n\nLast message: ${last}`;
@@ -3521,6 +3745,12 @@ function buildAgentSystemPrompt(agent, roomAgents, workspaceContext = '', role, 
   const roomMessaging = skillSet.has('agent.message')
     ? `\n\nYou can send a message into a room where you are already a member by emitting a controlled fenced block. To send to the target room, use this exact multi-line format:\n\`\`\`agentim-room-message room="${workspaceScope?.isExternal ? workspaceScope.room.name : 'Room Name'}"\nmessage text here\n\`\`\`\nPut the message body on the line after the opening fence. If the user asks you in a DM to notify or update another room, use this block. Do not claim a message was sent unless you emitted the block.`
     : '\n\nYou do not have agent.message enabled. Do not claim to send messages to other rooms.';
+  const roomCreate = skillSet.has('room.create')
+    ? `\n\nYou can create a new group room by emitting this controlled JSON block:\n\`\`\`agentim-room-create\n{"name":"Room name","description":"Purpose of the room","agents":["Agent Name"]}\n\`\`\`\nThe agents array is optional; you will automatically be added to rooms you create. Use existing Agent names or ids only.`
+    : '\n\nYou do not have room.create enabled. Do not claim to create rooms.';
+  const roomAssign = skillSet.has('room.assign')
+    ? `\n\nYou can attach existing Agents to an existing room by emitting this controlled JSON block:\n\`\`\`agentim-room-assign\n{"room":"Room name","agents":["Agent Name"],"triggerMode":"manual"}\n\`\`\`\nUse existing room and Agent names or ids only. Do not claim Agents were assigned unless you emitted the block.`
+    : '\n\nYou do not have room.assign enabled. Do not claim to assign Agents to rooms.';
   const taskPlanning = skillSet.has('task.schedule')
     ? `\n\nWhen future work should be scheduled, propose it as a controlled task plan block instead of only describing it:\n\`\`\`agentim-task-plan\n{\n  "title": "Plan title",\n  "items": [\n    {\n      "id": "short-step-id",\n      "title": "Task title",\n      "instructions": "Clear task instructions",\n      "agent": "Agent name or omit for yourself",\n      "scheduleAt": "ISO datetime or omit for soon",\n      "repeatInterval": "daily, weekly, or omit",\n      "dependsOn": ["previous-step-id"]\n    }\n  ]\n}\n\`\`\`\nUse dependsOn when a later Agent task must wait for earlier scheduled work to complete. Use this when the user asks you to make a plan, schedule follow-up work, or delegate future work.`
     : '\n\nYou do not have task.schedule enabled. Do not emit task scheduling protocol blocks.';
@@ -3528,7 +3758,7 @@ function buildAgentSystemPrompt(agent, roomAgents, workspaceContext = '', role, 
   const userApproval = skillSet.has('user.request_approval')
     ? `\n\nWhen you need an explicit user decision, emit a controlled approval request block:\n\`\`\`agentim-approval-request\n{\n  "title": "Decision title",\n  "reason": "Why approval is needed",\n  "approveLabel": "Approve",\n  "rejectLabel": "Reject",\n  "details": ["optional detail"]\n}\n\`\`\`\nUse this for risky, costly, ambiguous, or user-owned decisions.`
     : '\n\nYou do not have user.request_approval enabled. Mention @user in plain text for decisions instead.';
-  return `${legacyAgentPrompt}${rolePrompt}${collaboration}\n\nThe human user is @user. Mention @user when you need confirmation, missing requirements, or a decision from the user. @user is not an automated Agent.${approvalGuidance}${skills}${workspace}${workspaceRead}${workspaceWrite}${roomMessaging}${taskPlanning}${userApproval}`;
+  return `${legacyAgentPrompt}${rolePrompt}${collaboration}\n\nThe human user is @user. Mention @user when you need confirmation, missing requirements, or a decision from the user. @user is not an automated Agent.${approvalGuidance}${skills}${workspace}${workspaceRead}${workspaceWrite}${roomMessaging}${roomCreate}${roomAssign}${taskPlanning}${userApproval}`;
 }
 
 function buildProjectRequestContent({ name, type, instructions }) {

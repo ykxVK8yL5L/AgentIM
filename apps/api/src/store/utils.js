@@ -136,6 +136,60 @@ export const DEFAULT_SKILLS = [
     description: 'Mention @user for decisions, confirmations, or feedback.'
   },
   {
+    id: 'room.create',
+    name: 'Room Create',
+    version: '1.0.0',
+    category: 'collaboration',
+    common: true,
+    installed: true,
+    enabled: true,
+    source: 'system',
+    runtime: { kind: 'server', adapter: 'agentim.room' },
+    inputSchema: { type: 'object' },
+    outputSchema: { type: 'object' },
+    policy: { workspace: 'none', network: false, destructive: false },
+    ui: { card: 'message' },
+    riskLevel: 'medium',
+    requiresApproval: false,
+    description: 'Create a new room and optionally attach Agents to it.'
+  },
+  {
+    id: 'room.assign',
+    name: 'Room Assign',
+    version: '1.0.0',
+    category: 'collaboration',
+    common: true,
+    installed: true,
+    enabled: true,
+    source: 'system',
+    runtime: { kind: 'server', adapter: 'agentim.room' },
+    inputSchema: { type: 'object' },
+    outputSchema: { type: 'object' },
+    policy: { workspace: 'none', network: false, destructive: false },
+    ui: { card: 'message' },
+    riskLevel: 'medium',
+    requiresApproval: false,
+    description: 'Attach existing Agents to a room the Agent can access.'
+  },
+  {
+    id: 'task.schedule',
+    name: 'Task Schedule',
+    version: '1.0.0',
+    category: 'collaboration',
+    common: true,
+    installed: true,
+    enabled: true,
+    source: 'system',
+    runtime: { kind: 'server', adapter: 'agentim.task' },
+    inputSchema: { type: 'object' },
+    outputSchema: { type: 'object' },
+    policy: { workspace: 'none', network: false, destructive: false },
+    ui: { card: 'task-plan' },
+    riskLevel: 'medium',
+    requiresApproval: false,
+    description: 'Propose schedulable task plans for Agents.'
+  },
+  {
     id: 'workspace.delete',
     name: 'Workspace Delete',
     version: '1.0.0',
@@ -182,6 +236,8 @@ export const STANDARD_ROLE_SKILL_IDS = [
   'workspace.export',
   'artifact.card',
   'agent.message',
+  'room.create',
+  'room.assign',
   'user.notify'
 ];
 export const DEFAULT_ROLES = [
@@ -198,7 +254,7 @@ export const DEFAULT_ROLES = [
     name: 'Product Manager',
     description: 'Turns user intent into plans, acceptance criteria, and coordinated room work.',
     systemPrompt: 'You are a product manager Agent. Clarify goals, break work into practical plans, define acceptance criteria, and coordinate other Agents when useful.',
-    skillIds: ['provider.chat', 'workspace.read', 'artifact.card', 'agent.message', 'user.notify'],
+    skillIds: ['provider.chat', 'workspace.read', 'artifact.card', 'agent.message', 'room.create', 'room.assign', 'user.notify'],
     system: true
   },
   {
@@ -388,9 +444,11 @@ function normalizeRoles(rawRoles) {
       description: String(role.description ?? defaultRole?.description ?? ''),
       systemPrompt: String(role.systemPrompt ?? defaultRole?.systemPrompt ?? ''),
       system: Boolean(role.system ?? defaultRole?.system),
-      skillIds: role.skillIds === undefined
-        ? normalizeRoleSkillIds(defaultRole?.skillIds)
-        : normalizeRoleSkillIds(role.skillIds)
+      skillIds: Boolean(role.system ?? defaultRole?.system)
+        ? normalizeRoleSkillIds([...(role.skillIds ?? []), ...(defaultRole?.skillIds ?? [])])
+        : role.skillIds === undefined
+          ? normalizeRoleSkillIds(defaultRole?.skillIds)
+          : normalizeRoleSkillIds(role.skillIds)
     });
   }
   return Array.from(byId.values());

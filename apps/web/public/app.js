@@ -4693,6 +4693,8 @@ function renderMessageBody(message) {
   const content = renderMessageContent(message);
   const crossRoomMessage = parseCrossRoomMessage(content);
   if (crossRoomMessage) return renderCrossRoomMessageCard(crossRoomMessage);
+  const roomManagement = parseRoomManagementMessage(message, content);
+  if (roomManagement) return renderRoomManagementCard(roomManagement);
   const taskPlan = parseTaskPlanMessage(content);
   if (taskPlan) return renderTaskPlanCard(taskPlan, message.id);
   const approvalRequest = parseApprovalRequestMessage(content);
@@ -4971,6 +4973,40 @@ function renderCrossRoomMessageCard(message) {
         ${mentionsUser ? '<span class="cross-room-mention">Mentions you</span>' : ''}
       </div>
       <div class="cross-room-card-body">${escapeHtml(message.content)}</div>
+    </section>
+  `;
+}
+
+function parseRoomManagementMessage(message, content) {
+  if (message?.senderType !== 'system') return null;
+  const lines = String(content ?? '').split('\n').map((line) => line.trim()).filter(Boolean);
+  const createdLine = lines.find((line) => line.startsWith('Rooms created:'));
+  const assignedLine = lines.find((line) => line.startsWith('Agents assigned:'));
+  if (!createdLine && !assignedLine) return null;
+  return {
+    created: createdLine
+      ? createdLine.slice('Rooms created:'.length).split(',').map((item) => item.trim()).filter(Boolean)
+      : [],
+    assigned: assignedLine
+      ? assignedLine.slice('Agents assigned:'.length).split(',').map((item) => item.trim()).filter(Boolean)
+      : []
+  };
+}
+
+function renderRoomManagementCard(event) {
+  return `
+    <section class="cross-room-card">
+      <div class="cross-room-card-header">
+        <strong>Room management</strong>
+        <span>${escapeHtml([
+    event.created.length ? `${event.created.length} created` : '',
+    event.assigned.length ? `${event.assigned.length} assigned` : ''
+  ].filter(Boolean).join(' · '))}</span>
+      </div>
+      <div class="cross-room-card-body">
+        ${event.created.length > 0 ? `<p>Created: ${escapeHtml(event.created.join(', '))}</p>` : ''}
+        ${event.assigned.length > 0 ? `<p>Assigned: ${escapeHtml(event.assigned.join(', '))}</p>` : ''}
+      </div>
     </section>
   `;
 }
