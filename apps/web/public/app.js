@@ -1881,19 +1881,8 @@ function renderAgents() {
   }
 
   for (const item of els.agentList.querySelectorAll('[data-edit-agent]')) {
-    item.addEventListener('click', () => {
-      const agent = state.agents.find((entry) => entry.id === item.getAttribute('data-edit-agent'));
-      if (!agent) return;
-      state.editingAgentId = agent.id;
-      els.agentForm.elements.name.value = agent.name;
-      els.agentForm.elements.roleId.value = agent.roleId ?? 'general';
-      els.agentForm.elements.providerId.value = agent.providerId;
-      renderAgentModelOptions(agent.providerId, agent.model);
-      els.agentSubmit.textContent = 'Update Agent';
-      els.agentCancel.hidden = false;
-      activateAppSection('contacts');
-      activateSectionTab('contacts:create');
-      els.agentForm.elements.name.focus();
+    item.addEventListener('click', async () => {
+      await openAgentEditor(item.getAttribute('data-edit-agent'));
     });
   }
 
@@ -1910,6 +1899,24 @@ function renderAgents() {
       renderAll();
     });
   }
+}
+
+async function openAgentEditor(agentId) {
+  const agent = state.agents.find((entry) => entry.id === agentId);
+  if (!agent) return;
+  state.editingAgentId = agent.id;
+  els.agentForm.elements.name.value = agent.name;
+  els.agentForm.elements.roleId.value = agent.roleId ?? 'general';
+  els.agentForm.elements.providerId.value = agent.providerId;
+  renderAgentModelOptions(agent.providerId, agent.model);
+  if (els.agentForm.elements.bio) els.agentForm.elements.bio.value = agent.bio ?? '';
+  els.agentSubmit.textContent = 'Update Agent';
+  els.agentCancel.hidden = false;
+  activateAppSection('contacts');
+  activateSectionTab('contacts:create');
+  els.agentForm.elements.name.focus();
+  await refreshProviderModels(agent.providerId, agent.model);
+  renderAgentModelOptions(agent.providerId, agent.model);
 }
 
 function renderAgentTemplates() {
@@ -2812,6 +2819,7 @@ function renderRoomInspector() {
           ${run ? `<span>Run ${escapeHtml(run.status)} · ${escapeHtml(formatInvocationTime(run))}</span>` : ''}
           ${row.workItem ? `<span>${escapeHtml(row.workItem.kindLabel)} · ${escapeHtml(row.workItem.status)} · ${escapeHtml(row.workItem.title)}</span>` : ''}
           <div class="inspector-actions">
+            <button type="button" data-inspector-edit-agent="${escapeHtml(row.agent.id)}">Edit</button>
             ${run && ['queued', 'running'].includes(run.status) ? `<button type="button" class="danger-button" data-inspector-stop-run="${escapeHtml(run.id)}">Stop</button>` : ''}
             ${row.workItem?.kind === 'project' && row.workItem.status !== 'running' ? `<button type="button" data-inspector-retry-task="${escapeHtml(row.workItem.id)}">Retry Task</button>` : ''}
             ${row.workItem?.kind === 'scheduled' && ['scheduled', 'failed', 'cancelled'].includes(row.workItem.status) ? `<button type="button" data-inspector-run-task="${escapeHtml(row.workItem.id)}">Run Now</button>` : ''}
@@ -2819,6 +2827,21 @@ function renderRoomInspector() {
         </div>
       `;
     }).join('') : '<div class="muted-empty">No agents in this room.</div>'}
+  `;
+  const roomSettingsBody = `
+    <form class="inspector-room-form" id="room-inspector-form">
+      <label>
+        Name
+        <input name="name" value="${escapeHtml(room.name ?? '')}" required />
+      </label>
+      <label>
+        Description / Rules
+        <textarea name="description" rows="4" placeholder="Room goals, rules, workflow, and expected deliverables">${escapeHtml(room.description ?? '')}</textarea>
+      </label>
+      <div class="inspector-actions">
+        <button type="submit">Save Room</button>
+      </div>
+    </form>
   `;
   const tasksBody = `
     ${tasks.length > 0 ? tasks.map((row) => `
@@ -2925,6 +2948,11 @@ function renderRoomInspector() {
     </nav>
     ${tabPanel('details', `
       <div class="inspector-tab-heading">
+        <strong>Room Settings</strong>
+        <span>Define the room target, rules, and workflow</span>
+      </div>
+      ${roomSettingsBody}
+      <div class="inspector-tab-heading">
         <strong>Room Members</strong>
         <span>${escapeHtml(activeAgents.length)} active Agents in this conversation</span>
       </div>
@@ -2980,12 +3008,26 @@ function renderRoomInspector() {
   }
   bindSkillApprovalActions(els.roomInspectorContent);
 
+  const roomInspectorForm = els.roomInspectorContent.querySelector('#room-inspector-form');
+  if (roomInspectorForm) {
+    roomInspectorForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      await saveInspectorRoomSettings(roomInspectorForm);
+    });
+  }
+
   for (const item of els.roomInspectorContent.querySelectorAll('[data-inspector-stop-run]')) {
     item.addEventListener('click', async () => {
       await stopAgentRun(item.getAttribute('data-inspector-stop-run'));
       await refreshTasks();
       await refreshProjects();
       renderAll();
+    });
+  }
+
+  for (const item of els.roomInspectorContent.querySelectorAll('[data-inspector-edit-agent]')) {
+    item.addEventListener('click', async () => {
+      await openAgentEditor(item.getAttribute('data-inspector-edit-agent'));
     });
   }
 
@@ -3073,6 +3115,27 @@ function renderRoomInspector() {
       renderSkillInvocations();
       renderArtifacts();
     });
+  }
+}
+
+async function saveInspectorRoomSettings(form) {
+  if (!state.activeRoomId) return;
+  const data = formData(form);
+  try {
+    const room = await api(`/api/rooms/${state.activeRoomId}`, {
+      method: 'PATCH',
+      body: {
+        name: String(data.name ?? '').trim(),
+        description: String(data.description ?? '').trim()
+      }
+    });
+    replaceById(state.rooms, room);
+    state.conversations = state.rooms;
+    renderConversationList();
+    renderConversation();
+    renderRoomInspector();
+  } catch (error) {
+    alert(`Room settings update failed: ${roomErrorMessage(error)}`);
   }
 }
 
@@ -4378,11 +4441,11 @@ function defaultSkillManifest() {
   };
 }
 
-async function refreshProviderModels(providerId) {
+async function refreshProviderModels(providerId, selectedModel) {
   const provider = state.providers.find((entry) => entry.id === providerId);
   if (!provider) return;
 
-  renderAgentModelOptions(providerId, provider.defaultModel, true);
+  renderAgentModelOptions(providerId, selectedModel ?? provider.defaultModel, true);
   try {
     const result = await api(`/api/model-providers/${providerId}/models`);
     if (Array.isArray(result.models) && result.models.length > 0) {
@@ -4640,11 +4703,43 @@ async function refreshActiveRoomMessages(options = {}) {
 }
 
 async function refreshActiveRoomResources() {
+  await refreshGlobalState();
   await refreshTasks();
   await refreshProjects();
   await refreshSkillInvocations();
   await refreshSkillApprovals();
   await refreshArtifacts();
+}
+
+async function refreshGlobalState() {
+  const boot = await api('/api/bootstrap');
+  const previousActiveRoomId = state.activeRoomId;
+  state.settings = boot.settings ?? state.settings;
+  state.providers = boot.providers ?? state.providers;
+  state.agents = boot.agents ?? state.agents;
+  state.skills = boot.skills ?? state.skills;
+  state.roles = boot.roles ?? state.roles;
+  state.rooms = boot.rooms ?? boot.conversations ?? state.rooms;
+  state.conversations = state.rooms;
+  state.roomAgents = boot.roomAgents ?? state.roomAgents;
+  if (previousActiveRoomId && state.rooms.some((room) => room.id === previousActiveRoomId)) {
+    state.activeRoomId = previousActiveRoomId;
+  } else {
+    setActiveRoomId(state.rooms[0]?.id ?? null);
+  }
+  renderSettings();
+  renderRooms();
+  renderConversationList();
+  renderProviders();
+  renderRoles();
+  renderRoleSkillOptions();
+  renderSkills();
+  renderAgentRoleOptions();
+  renderAgents();
+  renderTaskAgentOptions();
+  renderProjectAgentOptions();
+  renderConversation();
+  renderRoomInspector();
 }
 
 function upsertMessage(message) {

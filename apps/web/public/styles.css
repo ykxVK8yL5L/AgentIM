@@ -1136,6 +1136,28 @@ button.inspector-section-title[type="button"]::before {
   gap: 5px;
 }
 
+.inspector-room-form {
+  display: grid;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: white;
+}
+
+.inspector-room-form label {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.inspector-room-form input,
+.inspector-room-form textarea {
+  width: 100%;
+  font-size: 13px;
+}
+
 .inspector-actions {
   display: flex;
   flex-wrap: wrap;

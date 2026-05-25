@@ -3587,6 +3587,29 @@ function normalizeProviderModelInput(models, defaultModel) {
     : [{ id: defaultModel, name: defaultModel }];
 }
 
+async function createRequestedRoomAgent(store, request, roomId) {
+  const name = String(request.name ?? '').trim();
+  if (!name) throw new Error('agent_name_required');
+  const provider = await resolvePlatformProvider(store, request.providerId ?? request.provider);
+  if (!provider) throw new Error('provider_not_found');
+  const model = String(request.model ?? provider.defaultModel ?? provider.models?.[0]?.id ?? '').trim();
+  if (!model) throw new Error('model_required');
+  const existing = await resolvePlatformAgent(store, name);
+  if (existing) {
+    await store.attachAgentToRoom(roomId, existing.id, { triggerMode: 'manual' });
+    return existing;
+  }
+  return store.createAgent({
+    name,
+    bio: String(request.bio ?? '').trim(),
+    runtimeType: 'hosted_agent',
+    roleId: await normalizeAgentRoleId(store, request.roleId ?? request.role),
+    providerId: provider.id,
+    model,
+    status: 'online'
+  });
+}
+
 async function applyRoomManagementActions(store, run, content, workspaceScope) {
   const createRequests = parseRoomCreateBlocks(content);
   const assignRequests = parseRoomAssignBlocks(content);
@@ -3601,6 +3624,9 @@ async function applyRoomManagementActions(store, run, content, workspaceScope) {
 
   if (createRequests.length > 0 && !await agentHasSkill(store, agent, 'room.create', skills)) {
     throw new Error('agent_missing_room_create_skill');
+  }
+  if (createRequests.some((request) => request.agentRequests.length > 0) && !await agentHasSkill(store, agent, 'agent.create', skills)) {
+    throw new Error('agent_missing_agent_create_skill');
   }
   if (assignRequests.length > 0 && !await agentHasSkill(store, agent, 'room.assign', skills)) {
     throw new Error('agent_missing_room_assign_skill');
@@ -3620,8 +3646,12 @@ async function applyRoomManagementActions(store, run, content, workspaceScope) {
         description: request.description
       });
       const agents = await resolveRoomManagementAgents(store, request.agents, request.roles);
+      const requestedAgents = [];
+      for (const agentRequest of request.agentRequests) {
+        requestedAgents.push(await createRequestedRoomAgent(store, agentRequest, room.id));
+      }
       const joins = [];
-      for (const targetAgent of uniqueAgents([agent, ...agents]).filter(Boolean)) {
+      for (const targetAgent of uniqueAgents([agent, ...agents, ...requestedAgents]).filter(Boolean)) {
         const join = await store.attachAgentToRoom(room.id, targetAgent.id, { triggerMode: 'manual' });
         joins.push({ agent: targetAgent, join });
       }
@@ -3944,7 +3974,8 @@ function parseRoomCreateBlocks(content) {
       description: String(payload.description ?? '').trim(),
       type: ['group', 'dm'].includes(payload.type) ? payload.type : 'group',
       agents: normalizeStringList(payload.agents ?? payload.agentIds ?? payload.agentNames).slice(0, 16),
-      roles: normalizeStringList(payload.roles ?? payload.roleIds ?? payload.roleNames).slice(0, 16)
+      roles: normalizeStringList(payload.roles ?? payload.roleIds ?? payload.roleNames).slice(0, 16),
+      agentRequests: normalizeAgentCreateRequests(payload.agentRequests ?? payload.createAgents).slice(0, 16)
     });
   }
   return blocks.slice(0, 8);
@@ -3986,6 +4017,21 @@ function parseInlineAttribute(header, name) {
 function normalizeStringList(value) {
   const list = Array.isArray(value) ? value : String(value ?? '').split(',');
   return list.map((item) => String(item ?? '').trim()).filter(Boolean);
+}
+
+function normalizeAgentCreateRequests(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => normalizeJsonObject(item, null))
+    .filter(Boolean)
+    .map((item) => ({
+      name: String(item.name ?? '').trim(),
+      bio: String(item.bio ?? '').trim(),
+      roleId: String(item.roleId ?? item.role ?? '').trim(),
+      providerId: String(item.providerId ?? item.provider ?? '').trim(),
+      model: String(item.model ?? '').trim()
+    }))
+    .filter((item) => item.name);
 }
 
 function normalizeJsonObject(value, fallback) {
@@ -4508,7 +4554,7 @@ function buildAgentSystemPrompt(agent, roomAgents, workspaceContext = '', role, 
     ? `\n\nYou can send a message into a room where you are already a member by emitting a controlled fenced block. To send to the target room, use this exact multi-line format:\n\`\`\`agentim-room-message room="${workspaceScope?.isExternal ? workspaceScope.room.name : 'Room Name'}"\nmessage text here\n\`\`\`\nPut the message body on the line after the opening fence. If the user asks you in a DM to notify or update another room, use this block. Do not claim a message was sent unless you emitted the block.`
     : '\n\nYou do not have agent.message enabled. Do not claim to send messages to other rooms.';
   const roomCreate = skillSet.has('room.create')
-    ? `\n\nYou can create a new group room by emitting this controlled JSON block:\n\`\`\`agentim-room-create\n{"name":"Room name","description":"Purpose of the room","agents":["Agent Name"],"roles":["designer","full-stack-developer"]}\n\`\`\`\nThe agents and roles arrays are optional; you will automatically be added to rooms you create. Use existing Agent names/ids or existing role ids/names only. Role selection attaches existing Agents with those roles; it does not create new Agents.`
+    ? `\n\nYou can create a new group room by emitting this controlled JSON block:\n\`\`\`agentim-room-create\n{"name":"Room name","description":"Purpose of the room","agents":["Agent Name"],"roles":["designer","full-stack-developer"],"agentRequests":[{"name":"New Agent","roleId":"designer","bio":"Short purpose"}]}\n\`\`\`\nThe agents and roles arrays are optional; you will automatically be added to rooms you create. Use existing Agent names/ids or existing role ids/names. If you also have agent.create enabled, agentRequests can create missing Agents and attach them to the new room. Omit providerId/model to use the first enabled provider and its default model. Do not claim Agents were created unless you emitted agentRequests and have agent.create.`
     : '\n\nYou do not have room.create enabled. Do not claim to create rooms.';
   const roomAssign = skillSet.has('room.assign')
     ? `\n\nYou can attach existing Agents to an existing room by emitting this controlled JSON block:\n\`\`\`agentim-room-assign\n{"room":"Room name","agents":["Agent Name"],"triggerMode":"manual"}\n\`\`\`\nUse existing room and Agent names or ids only. Do not claim Agents were assigned unless you emitted the block.`
