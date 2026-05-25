@@ -185,8 +185,14 @@ app.post('/api/auth/password', async (c) => {
   if (password.length < 6) {
     return c.json({ ok: false, error: 'password_min_length_6' }, 400);
   }
-  if (settings.auth?.passwordSet && !verifyPasswordSecret(input.currentPassword, settings.auth)) {
-    return c.json({ ok: false, error: 'invalid_current_password' }, 401);
+  if (settings.auth?.passwordSet) {
+    const currentPassword = String(input.currentPassword ?? '');
+    if (!currentPassword) {
+      return c.json({ ok: false, error: 'current_password_required' }, 400);
+    }
+    if (!verifyPasswordSecret(currentPassword, settings.auth)) {
+      return c.json({ ok: false, error: 'invalid_current_password' }, 401);
+    }
   }
   const auth = createPasswordSecret(password);
   const next = await store.updateSettings({ auth });

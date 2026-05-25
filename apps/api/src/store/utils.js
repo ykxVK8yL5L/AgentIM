@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, pbkdf2Sync, randomBytes, timingSafeEqual } from 'node:crypto';
 
 export function createId() {
   return crypto.randomUUID();
@@ -683,7 +683,9 @@ export function createDefaultSettings() {
     auth: {
       passwordSet: false,
       passwordSalt: '',
-      passwordHash: ''
+      passwordHash: '',
+      passwordAlgorithm: '',
+      passwordIterations: 0
     },
     network: {
       proxyEnabled: false,
@@ -708,7 +710,9 @@ export function normalizeSettings(raw) {
     auth: {
       passwordSet: Boolean(raw?.auth?.passwordHash),
       passwordSalt: String(raw?.auth?.passwordSalt ?? fallback.auth.passwordSalt),
-      passwordHash: String(raw?.auth?.passwordHash ?? fallback.auth.passwordHash)
+      passwordHash: String(raw?.auth?.passwordHash ?? fallback.auth.passwordHash),
+      passwordAlgorithm: String(raw?.auth?.passwordAlgorithm ?? fallback.auth.passwordAlgorithm),
+      passwordIterations: Number(raw?.auth?.passwordIterations ?? fallback.auth.passwordIterations)
     },
     network: {
       proxyEnabled: Boolean(raw?.network?.proxyEnabled),
@@ -756,18 +760,31 @@ function normalizeCustomRoomTemplates(value) {
 export function createPasswordSecret(password, salt = randomBytes(16).toString('hex')) {
   const normalizedPassword = String(password ?? '');
   const normalizedSalt = String(salt ?? '').trim() || randomBytes(16).toString('hex');
-  const hash = createHash('sha256').update(`${normalizedSalt}:${normalizedPassword}`).digest('hex');
+  const iterations = 210000;
+  const passwordHash = pbkdf2Sync(normalizedPassword, normalizedSalt, iterations, 32, 'sha256').toString('hex');
   return {
     passwordSalt: normalizedSalt,
-    passwordHash: hash,
+    passwordHash,
+    passwordAlgorithm: 'pbkdf2-sha256',
+    passwordIterations: iterations,
     passwordSet: Boolean(normalizedPassword)
   };
 }
 
 export function verifyPasswordSecret(password, auth = {}) {
   if (!auth?.passwordHash || !auth?.passwordSalt) return false;
-  const next = createPasswordSecret(password, auth.passwordSalt);
-  return next.passwordHash === auth.passwordHash;
+  const algorithm = String(auth.passwordAlgorithm ?? '').trim();
+  const iterations = Number(auth.passwordIterations);
+  const expected = String(auth.passwordHash);
+  const salt = String(auth.passwordSalt);
+  const actual = algorithm === 'pbkdf2-sha256' && Number.isFinite(iterations) && iterations > 0
+    ? pbkdf2Sync(String(password ?? ''), salt, Math.round(iterations), 32, 'sha256').toString('hex')
+    : createHash('sha256').update(`${salt}:${String(password ?? '')}`).digest('hex');
+  try {
+    return timingSafeEqual(Buffer.from(actual, 'hex'), Buffer.from(expected, 'hex'));
+  } catch {
+    return false;
+  }
 }
 
 function normalizeApprovalMode(value, fallback = 'auto') {

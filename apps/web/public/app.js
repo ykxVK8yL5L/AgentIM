@@ -93,6 +93,15 @@ const ACTIVE_RESOURCE_POLL_MS = 10000;
 const ACTIVE_ROOM_STORAGE_KEY = 'agentim.activeRoomId';
 const SEEN_MENTIONS_STORAGE_KEY = 'agentim.seenMentionIds';
 const ROOM_MENTION_COUNTS_STORAGE_KEY = 'agentim.roomMentionCounts';
+const LEGACY_PASSWORD_STORAGE_KEYS = [
+  'agentim.password',
+  'agentim.authPassword',
+  'agentim.loginPassword',
+  'agentim.currentPassword',
+  'promptlib.accessPassword',
+  'agentim_session',
+  'password'
+];
 
 const els = {
   apiStatus: document.querySelector('#api-status'),
@@ -214,6 +223,7 @@ window.activateWorkTab = activateWorkTab;
 window.activateSectionTab = activateSectionTab;
 window.activateMobilePane = activateMobilePane;
 
+clearLegacyPasswordStorage();
 await init();
 
 for (const button of els.appSectionButtons) {
@@ -416,12 +426,20 @@ els.authForm?.addEventListener('submit', async (event) => {
 els.passwordForm?.addEventListener('submit', async (event) => {
   event.preventDefault();
   const data = formData(els.passwordForm);
+  const auth = state.settings?.auth ?? {};
+  const currentPassword = String(data.currentPassword ?? '').trim();
+  const nextPassword = String(data.password ?? '');
+  if (auth.passwordSet && !currentPassword) {
+    alert(authErrorMessage({ message: 'current_password_required' }));
+    els.passwordForm.elements.currentPassword?.focus();
+    return;
+  }
   try {
     const result = await api('/api/auth/password', {
       method: 'POST',
       body: {
-        currentPassword: data.currentPassword,
-        password: data.password
+        currentPassword,
+        password: nextPassword
       }
     });
     state.settings.auth = result.auth ?? { passwordSet: true, authenticated: true };
@@ -953,12 +971,24 @@ function authErrorMessage(error) {
   const code = error?.data?.error ?? error?.message;
   const messages = {
     auth_required: 'Please log in first.',
+    current_password_required: 'Enter your current password first.',
     invalid_password: 'Password is incorrect.',
     invalid_current_password: 'Current password is incorrect.',
     password_not_set: 'Set a login password first.',
     password_min_length_6: 'Password must be at least 6 characters.'
   };
   return messages[code] ?? 'Authentication failed.';
+}
+
+function clearLegacyPasswordStorage() {
+  try {
+    for (const key of LEGACY_PASSWORD_STORAGE_KEYS) {
+      localStorage.removeItem(key);
+      sessionStorage.removeItem(key);
+    }
+  } catch {
+    // Storage can be unavailable in private or restricted contexts.
+  }
 }
 
 function renderConversationFilters() {
@@ -1012,6 +1042,9 @@ function renderRooms() {
       els.roomForm.elements.name.value = room.name;
       els.roomSubmit.textContent = 'Update Room';
       els.roomCancel.hidden = false;
+      activateAppSection('contacts');
+      activateSectionTab('contacts:create');
+      els.roomForm.elements.name.focus();
     });
   }
 
@@ -1211,6 +1244,7 @@ async function createRoomFromTemplate(templateId, form) {
   if (!provider) {
     alert('Create a model provider before creating a Room from a template.');
     activateAppSection('settings');
+    activateSectionTab('settings:providers');
     return;
   }
   const selectedAgentIds = data
@@ -1355,7 +1389,11 @@ function renderConversationList() {
   }
 
   for (const item of els.conversationList.querySelectorAll('[data-create-room-cta]')) {
-    item.addEventListener('click', () => activateAppSection('contacts'));
+    item.addEventListener('click', () => {
+      activateAppSection('contacts');
+      activateSectionTab('contacts:create');
+      els.roomForm.elements.name.focus();
+    });
   }
 }
 
@@ -1471,6 +1509,9 @@ function renderProviders() {
       els.providerForm.elements.defaultModel.value = provider.defaultModel;
       els.providerSubmit.textContent = 'Update';
       els.providerCancel.hidden = false;
+      activateAppSection('settings');
+      activateSectionTab('settings:providers');
+      els.providerForm.elements.name.focus();
     });
   }
 
@@ -1525,6 +1566,9 @@ function renderRoles() {
       setSelectedRoleSkillIds(role.skillIds ?? []);
       els.roleSubmit.textContent = role.system ? 'Update System Role' : 'Update Role';
       els.roleCancel.hidden = false;
+      activateAppSection('settings');
+      activateSectionTab('settings:roles');
+      els.roleForm.elements.name.focus();
     });
   }
 
@@ -1618,6 +1662,9 @@ function renderSkills() {
       els.skillForm.elements.manifest.value = JSON.stringify(skillManifestForEdit(skill), null, 2);
       els.skillSubmit.textContent = skill.common ? 'Update Common Skill' : 'Update Skill';
       els.skillCancel.hidden = false;
+      activateAppSection('settings');
+      activateSectionTab('settings:skills');
+      els.skillForm.elements.manifest.focus();
     });
   }
 
@@ -1758,6 +1805,9 @@ function renderAgents() {
       renderAgentModelOptions(agent.providerId, agent.model);
       els.agentSubmit.textContent = 'Update Agent';
       els.agentCancel.hidden = false;
+      activateAppSection('contacts');
+      activateSectionTab('contacts:create');
+      els.agentForm.elements.name.focus();
     });
   }
 
@@ -1828,6 +1878,7 @@ async function createAgentFromTemplate(templateId) {
   if (!provider) {
     alert('Create a model provider before creating an Agent from a template.');
     activateAppSection('settings');
+    activateSectionTab('settings:providers');
     return;
   }
   const model = provider.defaultModel ?? provider.models?.[0]?.id ?? '';
