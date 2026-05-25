@@ -20,6 +20,8 @@ export const app = new Hono();
 
 const MAX_AGENT_TURNS = 6;
 const MAX_CONCURRENT_AGENT_RUNS = 2;
+const AGENT_RUN_ABORT_STOP = 'user_stop';
+const AGENT_RUN_ABORT_TIMEOUT = 'provider_timeout';
 const runningAgentRuns = new Map();
 const queuedAgentRunIds = new Set();
 const recoveredStores = new WeakSet();
@@ -2163,10 +2165,11 @@ async function drainAgentRunQueue(store) {
       if (!run || run.status !== 'queued') continue;
 
       const controller = new AbortController();
-      runningAgentRuns.set(run.id, { controller });
+      const running = { controller, abortReason: null };
+      runningAgentRuns.set(run.id, running);
       activeAgentRunCount += 1;
 
-      runBackgroundAgentRunWithWatchdog(store, run.id, controller)
+      runBackgroundAgentRunWithWatchdog(store, run.id, running)
         .catch((error) => console.error('Agent run failed.', error))
         .finally(() => {
           runningAgentRuns.delete(run.id);
@@ -2179,12 +2182,12 @@ async function drainAgentRunQueue(store) {
   }
 }
 
-async function runBackgroundAgentRunWithWatchdog(store, runId, controller) {
+async function runBackgroundAgentRunWithWatchdog(store, runId, running) {
   const providerDeps = await createProviderDeps(store);
   const timeoutMs = normalizeProviderTimeoutInput(providerDeps.timeoutMs);
   let timeoutId;
   let timedOut = false;
-  const runPromise = runBackgroundAgentRun(store, runId, controller.signal)
+  const runPromise = runBackgroundAgentRun(store, runId, running.controller.signal, running)
     .catch((error) => {
       if (timedOut) return 'timed_out';
       throw error;
@@ -2192,7 +2195,7 @@ async function runBackgroundAgentRunWithWatchdog(store, runId, controller) {
   const timeoutPromise = new Promise((resolve) => {
     timeoutId = setTimeout(async () => {
       timedOut = true;
-      controller.abort();
+      abortAgentRun(running, AGENT_RUN_ABORT_TIMEOUT);
       const run = await store.getAgentRun(runId);
       if (run && (run.status === 'queued' || run.status === 'running')) {
         await failAgentRun(store, run, `provider_timeout_after_${timeoutMs}ms`);
@@ -2248,7 +2251,7 @@ async function createAndStartAgentRun(store, roomId, agentId, options = {}) {
   return { ok: true, run, message: linkedMessage };
 }
 
-async function runBackgroundAgentRun(store, runId, signal) {
+async function runBackgroundAgentRun(store, runId, signal, running) {
   const run = await store.getAgentRun(runId);
   if (!run || run.status === 'stopped') return;
 
@@ -2442,7 +2445,7 @@ async function runBackgroundAgentRun(store, runId, signal) {
 
     await startMentionedAgentRuns(store, run, finalContent);
   } catch (error) {
-    if (signal.aborted || error?.message === 'agent_run_stopped') {
+    if ((signal.aborted && running?.abortReason === AGENT_RUN_ABORT_STOP) || error?.message === 'agent_run_stopped') {
       await store.updateAgentRun(run.id, {
         status: 'stopped',
         stoppedAt: new Date().toISOString()
@@ -2454,6 +2457,16 @@ async function runBackgroundAgentRun(store, runId, signal) {
       });
       await completeScheduledTaskForRun(store, run.id, 'failed', 'agent_run_stopped');
       await completeProjectTaskForRun(store, run, 'failed', 'agent_run_stopped', content);
+      return;
+    }
+    if (signal.aborted && running?.abortReason === AGENT_RUN_ABORT_TIMEOUT) {
+      if (providerInvocation) {
+        await store.updateSkillInvocation(providerInvocation.id, {
+          status: 'failed',
+          error: `provider_timeout_after_${normalizeProviderTimeoutInput((await createProviderDeps(store)).timeoutMs)}ms`,
+          completedAt: new Date().toISOString()
+        });
+      }
       return;
     }
     if (providerInvocation) {
@@ -2575,7 +2588,12 @@ async function isAgentRunStopped(store, runId) {
 
 function stopRunningAgentRun(runId) {
   const running = runningAgentRuns.get(runId);
-  if (running) running.controller.abort();
+  if (running) abortAgentRun(running, AGENT_RUN_ABORT_STOP);
+}
+
+function abortAgentRun(running, reason) {
+  running.abortReason = reason;
+  running.controller.abort();
 }
 
 async function applyWorkspaceReadActions(store, run, content, workspaceScope) {
@@ -4117,8 +4135,8 @@ function normalizeMention(value) {
 
 function normalizeProviderTimeoutInput(value) {
   const number = Number(value);
-  if (!Number.isFinite(number)) return 60000;
-  return Math.min(Math.max(Math.round(number), 5000), 300000);
+  if (!Number.isFinite(number)) return 300000;
+  return Math.max(Math.round(number), 5000);
 }
 
 function normalizeMessagePageSizeInput(value) {

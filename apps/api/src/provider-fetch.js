@@ -36,8 +36,8 @@ export async function createProviderDeps(store) {
 
 function normalizeProviderTimeout(value) {
   const number = Number(value);
-  if (!Number.isFinite(number)) return 60000;
-  return Math.min(Math.max(Math.round(number), 5000), 300000);
+  if (!Number.isFinite(number)) return 300000;
+  return Math.max(Math.round(number), 5000);
 }
 
 function isProxyStreamingSupported() {

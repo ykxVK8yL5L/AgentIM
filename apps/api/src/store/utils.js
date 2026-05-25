@@ -630,7 +630,7 @@ export function createDefaultSettings() {
     network: {
       proxyEnabled: false,
       proxyUrl: '',
-      providerTimeoutMs: 60000
+      providerTimeoutMs: 300000
     },
     chat: {
       messagePageSize: 20
@@ -720,7 +720,7 @@ function normalizeApprovalMode(value, fallback = 'auto') {
 function normalizeTimeoutMs(value, fallback) {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
-  return Math.min(Math.max(Math.round(number), 5000), 300000);
+  return Math.max(Math.round(number), 5000);
 }
 
 function normalizeMessagePageSize(value, fallback) {

@@ -7,7 +7,7 @@ const state = {
     network: {
       proxyEnabled: false,
       proxyUrl: '',
-      providerTimeoutMs: 60000
+      providerTimeoutMs: 300000
     },
     chat: {
       messagePageSize: 20
@@ -56,6 +56,8 @@ const state = {
   activeStreams: new Set(),
   activeRunIds: new Set(),
   messagePollTimer: null,
+  messagePollInFlight: false,
+  lastResourcePollAt: 0,
   mentionPollTimer: null,
   stopRequested: false,
   messagesHasMore: false,
@@ -86,6 +88,8 @@ const state = {
 };
 
 const MAX_AGENT_TURNS = 6;
+const ACTIVE_MESSAGE_POLL_MS = 1500;
+const ACTIVE_RESOURCE_POLL_MS = 10000;
 const ACTIVE_ROOM_STORAGE_KEY = 'agentim.activeRoomId';
 const SEEN_MENTIONS_STORAGE_KEY = 'agentim.seenMentionIds';
 const ROOM_MENTION_COUNTS_STORAGE_KEY = 'agentim.roomMentionCounts';
@@ -298,44 +302,50 @@ els.roomInspectorClose?.addEventListener('click', () => {
 els.roomForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   const data = formData(els.roomForm);
-  if (state.editingRoomId) {
-    const room = await api(`/api/rooms/${state.editingRoomId}`, {
-      method: 'PATCH',
-      body: data
-    });
-    replaceById(state.rooms, room);
-    resetRoomForm();
-  } else {
-    const room = await api('/api/rooms', {
-      method: 'POST',
-      body: data
-    });
-    state.rooms.push(room);
-    setActiveRoomId(room.id);
-    resetMessagePagination();
-    state.agentRuns = [];
-    state.tasks = [];
-    state.projects = [];
-    state.projectTasks = [];
-    state.projectOutputs = {};
-    state.skillInvocations = [];
-    state.skillApprovals = [];
-    state.artifacts = [];
-    state.workspace = null;
-    state.workspaceFiles = [];
-    state.workspacePath = '';
-    state.activeFilePath = '';
-    resetPreview();
-    await refreshRoomAgents();
-    await refreshTasks();
-    await refreshProjects();
-    await refreshSkillInvocations();
-    await refreshSkillApprovals();
-    await refreshArtifacts();
-    await refreshWorkspace();
+  const editing = Boolean(state.editingRoomId);
+  try {
+    if (editing) {
+      const room = await api(`/api/rooms/${state.editingRoomId}`, {
+        method: 'PATCH',
+        body: data
+      });
+      replaceById(state.rooms, room);
+      resetRoomForm();
+    } else {
+      const room = await api('/api/rooms', {
+        method: 'POST',
+        body: data
+      });
+      state.rooms.push(room);
+      setActiveRoomId(room.id);
+      resetMessagePagination();
+      state.agentRuns = [];
+      state.tasks = [];
+      state.projects = [];
+      state.projectTasks = [];
+      state.projectOutputs = {};
+      state.skillInvocations = [];
+      state.skillApprovals = [];
+      state.artifacts = [];
+      state.workspace = null;
+      state.workspaceFiles = [];
+      state.workspacePath = '';
+      state.activeFilePath = '';
+      resetPreview();
+      await refreshRoomAgents();
+      await refreshTasks();
+      await refreshProjects();
+      await refreshSkillInvocations();
+      await refreshSkillApprovals();
+      await refreshArtifacts();
+      await refreshWorkspace();
+    }
+    state.conversations = state.rooms;
+    renderAll();
+    alert(editing ? 'Room updated successfully.' : 'Room created successfully.');
+  } catch (error) {
+    alert(`Room ${editing ? 'update' : 'creation'} failed: ${error instanceof Error ? error.message : String(error)}`);
   }
-  state.conversations = state.rooms;
-  renderAll();
 });
 
 els.roomCancel.addEventListener('click', resetRoomForm);
@@ -553,27 +563,33 @@ els.skillCancel.addEventListener('click', resetSkillForm);
 els.agentForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   const data = formData(els.agentForm);
-  if (state.editingAgentId) {
-    const saved = await api(`/api/agents/${state.editingAgentId}`, {
-      method: 'PATCH',
-      body: data
-    });
-    replaceById(state.agents, saved);
-    resetAgentForm();
-  } else {
-    const saved = await api('/api/agents', {
-      method: 'POST',
-      body: {
-        ...data,
-        roomId: state.activeRoomId
+  const editing = Boolean(state.editingAgentId);
+  try {
+    if (editing) {
+      const saved = await api(`/api/agents/${state.editingAgentId}`, {
+        method: 'PATCH',
+        body: data
+      });
+      replaceById(state.agents, saved);
+      resetAgentForm();
+    } else {
+      const saved = await api('/api/agents', {
+        method: 'POST',
+        body: {
+          ...data,
+          roomId: state.activeRoomId
+        }
+      });
+      state.agents.push(saved);
+      if (state.activeRoomId) {
+        await refreshRoomAgents();
       }
-    });
-    state.agents.push(saved);
-    if (state.activeRoomId) {
-      await refreshRoomAgents();
     }
+    renderAll();
+    alert(editing ? 'Agent updated successfully.' : 'Agent created successfully.');
+  } catch (error) {
+    alert(`Agent ${editing ? 'update' : 'creation'} failed: ${error instanceof Error ? error.message : String(error)}`);
   }
-  renderAll();
 });
 
 els.agentCancel.addEventListener('click', resetAgentForm);
@@ -911,7 +927,7 @@ function renderSettings() {
   }
   els.settingsForm.elements.proxyEnabled.checked = Boolean(state.settings?.network?.proxyEnabled);
   els.settingsForm.elements.proxyUrl.value = state.settings?.network?.proxyUrl ?? '';
-  els.settingsForm.elements.providerTimeoutMs.value = state.settings?.network?.providerTimeoutMs ?? 60000;
+  els.settingsForm.elements.providerTimeoutMs.value = state.settings?.network?.providerTimeoutMs ?? 300000;
   els.settingsForm.elements.messagePageSize.value = state.settings?.chat?.messagePageSize ?? 20;
   els.settingsForm.elements.approvalMode.value = state.settings?.approvals?.mode ?? 'auto';
 }
@@ -4422,8 +4438,8 @@ function ensureMessagePolling() {
     setResponseState(true, 'Agent is responding...');
   }
   if (state.messagePollTimer) return;
-  state.messagePollTimer = setInterval(refreshActiveRoomMessages, 1500);
-  refreshActiveRoomMessages();
+  state.messagePollTimer = setInterval(refreshActiveRoomMessages, ACTIVE_MESSAGE_POLL_MS);
+  refreshActiveRoomMessages({ refreshResources: true });
 }
 
 function ensureMentionPolling() {
@@ -4432,8 +4448,11 @@ function ensureMentionPolling() {
   refreshRoomMentionCounts();
 }
 
-async function refreshActiveRoomMessages() {
+async function refreshActiveRoomMessages(options = {}) {
   if (!state.activeRoomId) return;
+  if (state.messagePollInFlight) return;
+  state.messagePollInFlight = true;
+  let shouldRefreshResources = Boolean(options.refreshResources);
   try {
     const previousHeight = els.messages.scrollHeight;
     const previousTop = els.messages.scrollTop;
@@ -4448,11 +4467,12 @@ async function refreshActiveRoomMessages() {
       nextBeforeId: state.oldestMessageCursor?.id ?? page.pagination?.nextBeforeId
     });
     state.agentRuns = await api(`/api/rooms/${state.activeRoomId}/agent-runs`);
-    await refreshTasks();
-    await refreshProjects();
-    await refreshSkillInvocations();
-    await refreshSkillApprovals();
-    await refreshArtifacts();
+    const pendingWork = hasPendingWork();
+    shouldRefreshResources = shouldRefreshResources || !pendingWork || Date.now() - state.lastResourcePollAt > ACTIVE_RESOURCE_POLL_MS;
+    if (shouldRefreshResources) {
+      state.lastResourcePollAt = Date.now();
+      await refreshActiveRoomResources();
+    }
     renderMessages({
       stickToBottom,
       previousHeight,
@@ -4464,7 +4484,7 @@ async function refreshActiveRoomMessages() {
     renderSkillInvocations();
     renderArtifacts();
     renderRoomInspector();
-    if (hasPendingWork()) {
+    if (pendingWork) {
       setResponseState(true, 'Agent is responding...');
       return;
     }
@@ -4476,7 +4496,17 @@ async function refreshActiveRoomMessages() {
     if (state.activeResponseCount === 0) setResponseState(false);
   } catch (error) {
     console.warn('Message polling failed.', error);
+  } finally {
+    state.messagePollInFlight = false;
   }
+}
+
+async function refreshActiveRoomResources() {
+  await refreshTasks();
+  await refreshProjects();
+  await refreshSkillInvocations();
+  await refreshSkillApprovals();
+  await refreshArtifacts();
 }
 
 function upsertMessage(message) {
