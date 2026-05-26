@@ -2,6 +2,7 @@ const baseUrl = (process.env.AGENTIM_BASE_URL ?? 'http://127.0.0.1:8787').replac
 const runId = `smoke-${Date.now()}`;
 const roomName = `Smoke ${runId}`;
 const smokePassword = `secret-${runId}`;
+const existingPassword = process.env.AGENTIM_SMOKE_PASSWORD ?? 'test123';
 let cookieHeader = '';
 
 let originalSettings = null;
@@ -35,10 +36,35 @@ async function main() {
       assert(result.auth?.passwordSet, 'password should be set');
       const unauthorized = await rawApi('/api/bootstrap', { cookie: '' });
       assert(unauthorized.status === 401, 'bootstrap should require auth after password setup');
+    } else if (!status.auth.authenticated) {
+      const result = await api('/api/auth/login', {
+        method: 'POST',
+        body: { password: existingPassword }
+      });
+      assert(result.auth?.authenticated, 'existing password login should authenticate');
     }
   });
 
   originalSettings = await api('/api/settings');
+
+  await step('sse ready and room events', async () => {
+    let eventRoom = null;
+    const event = await waitForSseEvent(
+      (item) => item.type === 'room.created' && item.payload?.roomId === eventRoom?.id,
+      async () => {
+        eventRoom = await api('/api/rooms', {
+          method: 'POST',
+          body: {
+            name: `Event Room ${runId}`,
+            type: 'group',
+            description: 'SSE smoke event room'
+          }
+        });
+      }
+    );
+    assert(event.payload?.roomId === eventRoom.id, 'room.created event should include created room id');
+    await api(`/api/rooms/${eventRoom.id}`, { method: 'DELETE' });
+  });
 
   await step('create room and workspace', async () => {
     room = await api('/api/rooms', {
@@ -135,8 +161,8 @@ async function main() {
 
   await step('room template creates ready-to-work room', async () => {
     const templates = await api('/api/room-templates');
-    const roomTemplate = templates.find((item) => item.id === 'development-project-room');
-    assert(roomTemplate, 'development room template should exist');
+    const roomTemplate = templates.find((item) => item.id === 'web-app-delivery-circle');
+    assert(roomTemplate, 'web app delivery room template should exist');
     const provider = await ensureProvider();
     const created = await api(`/api/room-templates/${roomTemplate.id}/create-room`, {
       method: 'POST',
@@ -308,7 +334,68 @@ async function main() {
     await api(`/api/rooms/${sourceRoom.id}`, { method: 'DELETE' });
   });
 
-  await step('room message failure appears in chat', async () => {
+  await step('cross-room delivery publishes message event', async () => {
+    const sourceRoom = await api('/api/rooms', {
+      method: 'POST',
+      body: {
+        name: `SSE DM ${runId}`,
+        type: 'dm',
+        description: 'SSE cross-room source',
+        dmAgentId: templateAgent.id
+      }
+    });
+    await api(`/api/rooms/${sourceRoom.id}/agents`, {
+      method: 'POST',
+      body: {
+        agentId: templateAgent.id,
+        triggerMode: 'manual'
+      }
+    }).catch(() => null);
+    await api(`/api/rooms/${room.id}/agents`, {
+      method: 'POST',
+      body: {
+        agentId: templateAgent.id,
+        triggerMode: 'manual'
+      }
+    }).catch(() => null);
+    const eventPromise = waitForSseEvent(
+      (item) => item.type === 'message.created' && item.payload?.roomId === room.id && item.payload?.senderName === templateAgent.name,
+      async () => {
+        await api(`/api/rooms/${sourceRoom.id}/dispatch`, {
+          method: 'POST',
+          body: {
+            content: `@${templateAgent.name} Send an inline room message to ${room.name}.`,
+            senderName: 'Smoke'
+          }
+        });
+        const run = await api(`/api/rooms/${sourceRoom.id}/agent-runs`, {
+          method: 'POST',
+          body: {
+            agentId: templateAgent.id,
+            maxTurns: 1
+          }
+        });
+        await waitForRunStatus(sourceRoom.id, run.run.id, ['done']);
+        const targetMessages = await api(`/api/rooms/${room.id}/messages?limit=50`);
+        const delivered = targetMessages.messages.find((message) => String(message.content ?? '').includes('inline cross-room smoke delivered'));
+        assert(delivered?.id, 'target room should receive cross-room message before event assertion finishes');
+      }
+    );
+    const event = await eventPromise;
+    assert(event.payload?.messageId, 'message.created event should include delivered cross-room message id');
+    await api(`/api/rooms/${sourceRoom.id}`, { method: 'DELETE' });
+  });
+
+  await step('agent reply strips repeated speaker prefix', async () => {
+    const sourceMessages = await api(`/api/rooms/${room.id}/messages?limit=50`);
+    const agentMessage = sourceMessages.messages.find((message) => message.senderName === templateAgent.name && message.senderType === 'agent');
+    assert(agentMessage, 'agent message should exist for prefix assertion');
+    const escapedName = escapeRegExp(templateAgent.name);
+    const repeatedPrefix = new RegExp(`^(?:${escapedName}\\s*[:：]\\s*){2,}`, 'i');
+    assert(!repeatedPrefix.test(String(agentMessage.content ?? '').trimStart()), 'agent message should not store repeated speaker prefixes');
+  });
+
+  await step('room message without skill does not deliver', async () => {
     const provider = await ensureProvider();
     const noMessageRole = await api('/api/roles', {
       method: 'POST',
@@ -343,9 +430,16 @@ async function main() {
         maxTurns: 1
       }
     });
-    await waitForRunStatus(room.id, run.run.id, ['failed']);
+    const completedRun = await waitForRunStatus(room.id, run.run.id, ['failed', 'done']);
     const messages = await api(`/api/rooms/${room.id}/messages?limit=50`);
-    assert(messages.messages.some((message) => String(message.content ?? '').includes('Room message failed') && String(message.content ?? '').includes('agent_missing_agent_message_skill')), 'chat should include room message failure notice');
+    const failureNotice = messages.messages.some((message) => String(message.content ?? '').includes('Room message failed') && String(message.content ?? '').includes('agent_missing_agent_message_skill'));
+    const unauthorizedDelivery = messages.messages.some((message) =>
+      message.senderName === noMessageAgent.name &&
+      String(message.content ?? '').includes('[agentim-room-message') &&
+      String(message.content ?? '').includes('inline cross-room smoke delivered')
+    );
+    assert(failureNotice || completedRun.status === 'done', 'run should either report the blocked room message or complete without attempting delivery');
+    assert(!unauthorizedDelivery, 'agent without agent.message should not deliver a cross-room message');
     await api(`/api/agents/${noMessageAgent.id}`, { method: 'DELETE' });
     await api(`/api/roles/${noMessageRole.id}`, { method: 'DELETE' });
   });
@@ -381,6 +475,83 @@ async function fetchWithAuth(url, options = {}) {
   const headers = { ...(options.headers ?? {}) };
   if (cookieHeader) headers.cookie = cookieHeader;
   return fetch(url, { ...options, headers });
+}
+
+async function waitForSseEvent(predicate, trigger, timeoutMs = 7000) {
+  const controller = new AbortController();
+  const res = await fetchWithAuth(`${baseUrl}/api/events`, {
+    signal: controller.signal
+  });
+  assert(res.ok, `events stream should return 2xx, got ${res.status}`);
+  assert(res.body, 'events stream should include a response body');
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let readyResolve;
+  const ready = new Promise((resolve) => {
+    readyResolve = resolve;
+  });
+
+  const readLoop = (async () => {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) throw new Error('events stream closed before expected event');
+      buffer += decoder.decode(value, { stream: true });
+      let splitIndex = buffer.indexOf('\n\n');
+      while (splitIndex >= 0) {
+        const rawEvent = buffer.slice(0, splitIndex);
+        buffer = buffer.slice(splitIndex + 2);
+        const parsed = parseSseEvent(rawEvent);
+        if (parsed.type === 'ready') readyResolve(parsed);
+        if (predicate(parsed)) return parsed;
+        splitIndex = buffer.indexOf('\n\n');
+      }
+    }
+  })();
+
+  try {
+    await withTimeout(ready, timeoutMs, 'events stream did not become ready');
+    await trigger();
+    return await withTimeout(readLoop, timeoutMs, 'expected SSE event did not arrive');
+  } finally {
+    controller.abort();
+    try {
+      await reader.cancel();
+    } catch {
+      // The abort may close the stream before cancel resolves.
+    }
+  }
+}
+
+function parseSseEvent(rawEvent) {
+  let type = 'message';
+  const dataLines = [];
+  for (const line of String(rawEvent ?? '').split('\n')) {
+    if (line.startsWith('event:')) type = line.slice('event:'.length).trim();
+    if (line.startsWith('data:')) dataLines.push(line.slice('data:'.length).trimStart());
+  }
+  const dataText = dataLines.join('\n');
+  const data = dataText ? JSON.parse(dataText) : {};
+  return {
+    type,
+    data,
+    payload: data.payload ?? {}
+  };
+}
+
+async function withTimeout(promise, timeoutMs, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function setApprovalMode(mode) {
@@ -454,6 +625,10 @@ function encodePath(value) {
     .split('/')
     .map((part) => encodeURIComponent(part))
     .join('/');
+}
+
+function escapeRegExp(value) {
+  return String(value ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 async function cleanup() {

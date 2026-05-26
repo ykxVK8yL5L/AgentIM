@@ -57,6 +57,13 @@ const state = {
   activeRunIds: new Set(),
   messagePollTimer: null,
   messagePollInFlight: false,
+  activeMessagePollUntil: 0,
+  followLatestMessages: true,
+  eventSource: null,
+  eventRefreshTimer: null,
+  eventRefreshInFlight: false,
+  globalEventRefreshTimer: null,
+  eventMentionRefreshTimers: {},
   lastResourcePollAt: 0,
   mentionPollTimer: null,
   stopRequested: false,
@@ -90,7 +97,7 @@ const state = {
 
 const MAX_AGENT_TURNS = 6;
 const ACTIVE_MESSAGE_POLL_MS = 1500;
-const ACTIVE_RESOURCE_POLL_MS = 10000;
+const ACTIVE_MESSAGE_GRACE_MS = 12000;
 const ACTIVE_ROOM_STORAGE_KEY = 'agentim.activeRoomId';
 const SEEN_MENTIONS_STORAGE_KEY = 'agentim.seenMentionIds';
 const ROOM_MENTION_COUNTS_STORAGE_KEY = 'agentim.roomMentionCounts';
@@ -365,6 +372,7 @@ els.messages.addEventListener('scroll', () => {
   if (els.messages.scrollTop <= 12) {
     loadOlderMessages();
   }
+  state.followLatestMessages = isMessagesNearBottom(32);
   updateScrollLatestButton();
 });
 
@@ -749,9 +757,11 @@ els.messageForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   const content = els.messageForm.elements.content.value.trim();
   if (!content || !state.activeRoomId) return;
+  const explicitMentions = resolveComposerMentions(content);
 
   state.stopRequested = false;
   state.activeResponseCount += 1;
+  markActiveMessagePolling();
   setResponseState(true, 'Sending message...');
 
   try {
@@ -759,6 +769,10 @@ els.messageForm.addEventListener('submit', async (event) => {
       method: 'POST',
       body: {
         content,
+        targetAgentIds: explicitMentions
+          .filter((mention) => mention.id !== 'all')
+          .map((mention) => mention.id),
+        targetAll: explicitMentions.some((mention) => mention.id === 'all'),
         senderName: 'You',
         replyToMessageId: state.replyToMessage?.id
       }
@@ -870,6 +884,7 @@ async function init(options = {}) {
   resetSkillForm();
   resetTaskForm();
   resetProjectForm();
+  connectEventStream();
   ensureMessagePolling();
   ensureMentionPolling();
   if (state.providers[0]) {
@@ -3409,7 +3424,7 @@ function compareMessagesAsc(a, b) {
 }
 
 function renderMessages(options = {}) {
-  const shouldStickToBottom = options.stickToBottom ?? isMessagesNearBottom();
+  const shouldStickToBottom = options.stickToBottom ?? state.followLatestMessages;
   const previousHeight = options.previousHeight ?? els.messages.scrollHeight;
   const previousTop = options.previousTop ?? els.messages.scrollTop;
   const control = state.messagesHasMore
@@ -3433,6 +3448,7 @@ function renderMessages(options = {}) {
           </span>
           <span>
             ${new Date(message.createdAt).toLocaleTimeString()}
+            <button type="button" class="message-action" data-copy-message="${escapeHtml(message.id)}">Copy</button>
             <button type="button" class="message-action" data-reply-message="${escapeHtml(message.id)}">Reply</button>
             ${isPendingMessage(message) && message.runId
           ? `<button type="button" class="message-action danger-text" data-stop-run="${escapeHtml(message.runId)}">Stop</button>`
@@ -3456,7 +3472,7 @@ function renderMessages(options = {}) {
   if (options.preserveScroll) {
     els.messages.scrollTop = els.messages.scrollHeight - previousHeight + previousTop;
   } else if (shouldStickToBottom) {
-    els.messages.scrollTop = els.messages.scrollHeight;
+    scrollMessagesToBottom({ immediate: true, updateButton: false });
   } else {
     els.messages.scrollTop = Math.min(previousTop, els.messages.scrollHeight);
   }
@@ -3465,6 +3481,19 @@ function renderMessages(options = {}) {
   const loadOlderButton = els.messages.querySelector('[data-load-older]');
   if (loadOlderButton) {
     loadOlderButton.addEventListener('click', loadOlderMessages);
+  }
+
+  for (const item of els.messages.querySelectorAll('[data-copy-message]')) {
+    item.addEventListener('click', async () => {
+      const message = state.messages.find((entry) => entry.id === item.getAttribute('data-copy-message'));
+      if (!message) return;
+      await copyTextToClipboard(String(message.content ?? ''));
+      const previous = item.textContent;
+      item.textContent = 'Copied';
+      setTimeout(() => {
+        item.textContent = previous;
+      }, 1200);
+    });
   }
 
   for (const item of els.messages.querySelectorAll('[data-reply-message]')) {
@@ -3533,19 +3562,47 @@ function isMessagesNearBottom(threshold = 96) {
   return els.messages.scrollHeight - els.messages.scrollTop - els.messages.clientHeight <= threshold;
 }
 
-function scrollMessagesToBottom() {
+function scrollMessagesToBottom(options = {}) {
   if (!els.messages) return;
+  state.followLatestMessages = true;
+  const top = els.messages.scrollHeight;
   els.messages.scrollTo({
-    top: els.messages.scrollHeight,
-    behavior: 'smooth'
+    top,
+    behavior: options.immediate ? 'auto' : 'auto'
   });
-  setTimeout(updateScrollLatestButton, 220);
+  els.messages.scrollTop = els.messages.scrollHeight;
+  if (options.updateButton !== false) {
+    requestAnimationFrame(() => {
+      els.messages.scrollTop = els.messages.scrollHeight;
+      updateScrollLatestButton();
+    });
+    setTimeout(() => {
+      els.messages.scrollTop = els.messages.scrollHeight;
+      updateScrollLatestButton();
+    }, 80);
+  }
 }
 
 function updateScrollLatestButton() {
   if (!els.scrollLatest || !els.messages) return;
   const canScroll = els.messages.scrollHeight > els.messages.clientHeight + 8;
   els.scrollLatest.hidden = !canScroll || isMessagesNearBottom(140);
+}
+
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', '');
+  textarea.style.position = 'fixed';
+  textarea.style.left = '-9999px';
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand('copy');
+  textarea.remove();
 }
 
 async function refreshWorkspace(path = state.workspacePath) {
@@ -4047,6 +4104,7 @@ function isAgentInActiveRoom(agentId) {
 }
 
 function renderMentionBar(activeAgents) {
+  if (!els.mentionBar) return;
   const room = state.rooms.find((c) => c.id === state.activeRoomId);
   if (room?.type === 'dm') {
     els.mentionBar.innerHTML = '';
@@ -4062,15 +4120,42 @@ function renderMentionBar(activeAgents) {
     .filter(Boolean)
     .map((agent) => `<button type="button" data-mention="${escapeHtml(agent.name)}">@${escapeHtml(agent.name)}</button>`)
     .join('');
-
   for (const item of els.mentionBar.querySelectorAll('[data-mention]')) {
     item.addEventListener('click', () => {
-      insertMention(item.getAttribute('data-mention'));
+      insertTextMention(item.getAttribute('data-mention'));
     });
   }
 }
 
-function insertMention(name) {
+function resolveComposerMentions(content) {
+  const mentions = [];
+  const activeAgents = state.agents.filter((agent) => isAgentInActiveRoom(agent.id));
+  if (mentionContentMatchesName(content, 'all') && !mentions.some((mention) => mention.id === 'all')) {
+    mentions.push({ id: 'all', name: 'all' });
+  }
+  for (const agent of activeAgents) {
+    if (
+      mentionContentMatchesName(content, agent.name)
+      && !mentions.some((mention) => mention.id === agent.id)
+    ) {
+      mentions.push({ id: agent.id, name: agent.name });
+    }
+  }
+  return mentions;
+}
+
+function mentionContentMatchesName(content, name) {
+  const escaped = escapeRegExp(String(name ?? '').trim()).replace(/\s+/g, '\\s+');
+  if (!escaped) return false;
+  return new RegExp(`(^|\\s)@${escaped}(?=$|[\\s，。！？、,.!?:;；：）)\\]}])`, 'i')
+    .test(String(content ?? ''));
+}
+
+function escapeRegExp(value) {
+  return String(value ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function insertTextMention(name) {
   const textarea = els.messageForm.elements.content;
   const mention = `@${name} `;
   const start = textarea.selectionStart ?? textarea.value.length;
@@ -4100,17 +4185,13 @@ function setReplyTarget(message) {
 }
 
 function prependMention(name) {
+  insertTextMention(name);
   const textarea = els.messageForm.elements.content;
-  const mention = `@${name} `;
-  const value = textarea.value.trimStart();
-  textarea.value = value ? `${mention}${value}` : mention;
   textarea.setSelectionRange(textarea.value.length, textarea.value.length);
 }
 
 function messageMentionsAgent(content, name) {
-  const normalizedName = normalizeMentionToken(name);
-  return Array.from(String(content ?? '').matchAll(/@([^\s@]+)/g))
-    .some((match) => normalizeMentionToken(match[1]) === normalizedName);
+  return mentionContentMatchesName(content, name);
 }
 
 function normalizeMentionToken(value) {
@@ -4694,7 +4775,7 @@ function resetProjectForm() {
 }
 
 function updateMessageNode(message) {
-  const stickToBottom = isMessagesNearBottom();
+  const stickToBottom = state.followLatestMessages;
   const previousTop = els.messages.scrollTop;
   const index = state.messages.findIndex((m) => m.id === message.id);
   if (index >= 0) state.messages[index] = message;
@@ -4705,8 +4786,9 @@ function updateMessageNode(message) {
   }
   const node = wrapper?.querySelector('.message-content');
   if (node) node.innerHTML = renderMessageBody(message);
-  if (stickToBottom) els.messages.scrollTop = els.messages.scrollHeight;
+  if (stickToBottom) scrollMessagesToBottom({ immediate: true, updateButton: false });
   else els.messages.scrollTop = previousTop;
+  updateScrollLatestButton();
 }
 
 function setResponseState(isResponding, label = '') {
@@ -4762,22 +4844,202 @@ async function retryAgentRun(runId) {
 
 function ensureMessagePolling() {
   if (!state.activeRoomId) return;
-  if (hasPendingWork()) {
+  if (!shouldPollActiveRoomMessages()) {
+    stopMessagePolling();
+    return;
+  }
+  if (hasPendingWork() || state.activeResponseCount > 0) {
     setResponseState(true, 'Agent is responding...');
   }
   if (state.messagePollTimer) return;
   state.messagePollTimer = setInterval(refreshActiveRoomMessages, ACTIVE_MESSAGE_POLL_MS);
-  refreshActiveRoomMessages({ refreshResources: true });
+  refreshActiveRoomMessages();
+}
+
+function connectEventStream() {
+  if (!window.EventSource || state.eventSource) return;
+  const source = new EventSource('/api/events');
+  state.eventSource = source;
+  source.addEventListener('ready', () => {});
+  source.addEventListener('heartbeat', () => {});
+  [
+    'message.created',
+    'message.updated',
+    'agent_run.created',
+    'agent_run.updated',
+    'room.created',
+    'room.updated',
+    'room.deleted',
+    'room.members.updated',
+    'agent.created',
+    'agent.updated',
+    'agent.deleted',
+    'role.created',
+    'role.updated',
+    'role.deleted'
+  ].forEach((type) => {
+    source.addEventListener(type, (event) => handlePlatformEvent(type, event));
+  });
+  source.addEventListener('error', () => {
+    if (source.readyState === EventSource.CLOSED && state.eventSource === source) {
+      state.eventSource = null;
+    }
+  });
+}
+
+function closeEventStream() {
+  if (!state.eventSource) return;
+  state.eventSource.close();
+  state.eventSource = null;
+}
+
+function handlePlatformEvent(type, event) {
+  let detail = null;
+  try {
+    detail = JSON.parse(event.data);
+  } catch {
+    detail = {};
+  }
+  const payload = detail?.payload ?? {};
+  if (type.startsWith('message.') || type.startsWith('agent_run.')) {
+    handleRoomActivityEvent(type, payload);
+    return;
+  }
+  scheduleGlobalEventRefresh(payload);
+}
+
+function handleRoomActivityEvent(type, payload = {}) {
+  const roomId = payload.roomId;
+  if (!roomId) return;
+  const activeStatus = payload.status === 'queued' || payload.status === 'running' || payload.pending;
+  if (roomId === state.activeRoomId) {
+    if (activeStatus || type === 'agent_run.created') {
+      markActiveMessagePolling();
+      ensureMessagePolling();
+    }
+    scheduleActiveRoomEventRefresh({ refreshResources: !activeStatus });
+    return;
+  }
+  if (type === 'message.created' || type === 'message.updated') {
+    scheduleRoomMentionRefresh(roomId);
+  }
+}
+
+function scheduleActiveRoomEventRefresh(options = {}) {
+  if (!state.activeRoomId) return;
+  if (state.eventRefreshTimer) clearTimeout(state.eventRefreshTimer);
+  state.eventRefreshTimer = setTimeout(() => {
+    state.eventRefreshTimer = null;
+    refreshActiveRoomFromEvent(options).catch((error) => {
+      console.warn('Event refresh failed.', error);
+    });
+  }, 120);
+}
+
+async function refreshActiveRoomFromEvent(options = {}) {
+  if (!state.activeRoomId) return;
+  if (state.eventRefreshInFlight || state.messagePollInFlight) {
+    scheduleActiveRoomEventRefresh(options);
+    return;
+  }
+  state.eventRefreshInFlight = true;
+  try {
+    const previousHeight = els.messages.scrollHeight;
+    const previousTop = els.messages.scrollTop;
+    const stickToBottom = isMessagesNearBottom();
+    await loadLatestMessages({ markMentionsSeen: true });
+    state.agentRuns = await api(`/api/rooms/${state.activeRoomId}/agent-runs`);
+    pruneInactiveRunIds();
+    if (options.refreshResources) {
+      await refreshActiveRoomResources();
+    }
+    renderMessages({ stickToBottom, previousHeight, previousTop });
+    renderTasks();
+    renderProjects();
+    renderAgentWorkCenter();
+    renderSkillInvocations();
+    renderArtifacts();
+    renderRoomInspector();
+    if (hasPendingWork()) {
+      setResponseState(true, 'Agent is responding...');
+      markActiveMessagePolling();
+      ensureMessagePolling();
+    } else if (state.activeResponseCount === 0) {
+      setResponseState(false);
+      stopMessagePolling();
+    }
+  } finally {
+    state.eventRefreshInFlight = false;
+  }
+}
+
+function scheduleGlobalEventRefresh(payload = {}) {
+  if (state.globalEventRefreshTimer) clearTimeout(state.globalEventRefreshTimer);
+  state.globalEventRefreshTimer = setTimeout(async () => {
+    state.globalEventRefreshTimer = null;
+    try {
+      await refreshGlobalState();
+      if (payload.roomId && payload.roomId === state.activeRoomId) {
+        await refreshRoomAgents();
+        renderRoomInspector();
+      }
+    } catch (error) {
+      console.warn('Global event refresh failed.', error);
+    }
+  }, 180);
+}
+
+function scheduleRoomMentionRefresh(roomId) {
+  if (state.eventMentionRefreshTimers[roomId]) {
+    clearTimeout(state.eventMentionRefreshTimers[roomId]);
+  }
+  state.eventMentionRefreshTimers[roomId] = setTimeout(async () => {
+    delete state.eventMentionRefreshTimers[roomId];
+    try {
+      const limit = state.settings?.chat?.messagePageSize ?? 20;
+      const page = await api(`/api/rooms/${roomId}/messages?limit=${encodeURIComponent(limit)}`);
+      notifyNewUserMentions(page.messages ?? []);
+      renderConversationList();
+    } catch (error) {
+      console.warn('Room mention refresh failed.', error);
+    }
+  }, 250);
 }
 
 function ensureMentionPolling() {
-  if (state.mentionPollTimer) return;
-  state.mentionPollTimer = setInterval(refreshRoomMentionCounts, 4000);
-  refreshRoomMentionCounts();
+  if (state.mentionPollTimer) {
+    clearInterval(state.mentionPollTimer);
+    state.mentionPollTimer = null;
+  }
+}
+
+function markActiveMessagePolling(duration = ACTIVE_MESSAGE_GRACE_MS) {
+  state.activeMessagePollUntil = Math.max(state.activeMessagePollUntil, Date.now() + duration);
+}
+
+function shouldPollActiveRoomMessages() {
+  return Boolean(state.activeRoomId)
+    && (
+      state.activeResponseCount > 0
+      || state.activeRunIds.size > 0
+      || hasPendingMessages()
+      || Date.now() < state.activeMessagePollUntil
+    );
+}
+
+function stopMessagePolling() {
+  if (state.messagePollTimer) {
+    clearInterval(state.messagePollTimer);
+    state.messagePollTimer = null;
+  }
 }
 
 async function refreshActiveRoomMessages(options = {}) {
   if (!state.activeRoomId) return;
+  if (!shouldPollActiveRoomMessages()) {
+    stopMessagePolling();
+    return;
+  }
   if (state.messagePollInFlight) return;
   state.messagePollInFlight = true;
   let shouldRefreshResources = Boolean(options.refreshResources);
@@ -4795,8 +5057,8 @@ async function refreshActiveRoomMessages(options = {}) {
       nextBeforeId: state.oldestMessageCursor?.id ?? page.pagination?.nextBeforeId
     });
     state.agentRuns = await api(`/api/rooms/${state.activeRoomId}/agent-runs`);
+    pruneInactiveRunIds();
     const pendingWork = hasPendingWork();
-    shouldRefreshResources = shouldRefreshResources || !pendingWork || Date.now() - state.lastResourcePollAt > ACTIVE_RESOURCE_POLL_MS;
     if (shouldRefreshResources) {
       state.lastResourcePollAt = Date.now();
       await refreshActiveRoomResources();
@@ -4816,10 +5078,8 @@ async function refreshActiveRoomMessages(options = {}) {
       setResponseState(true, 'Agent is responding...');
       return;
     }
-    if (state.messagePollTimer) {
-      clearInterval(state.messagePollTimer);
-      state.messagePollTimer = null;
-    }
+    if (shouldPollActiveRoomMessages()) return;
+    stopMessagePolling();
     state.activeRunIds.clear();
     if (state.activeResponseCount === 0) setResponseState(false);
   } catch (error) {
@@ -4889,6 +5149,17 @@ function hasPendingMessages() {
 
 function hasPendingWork() {
   return hasPendingMessages() || state.agentRuns.some((run) => run.status === 'queued' || run.status === 'running');
+}
+
+function pruneInactiveRunIds() {
+  const activeIds = new Set(
+    state.agentRuns
+      .filter((run) => run.status === 'queued' || run.status === 'running')
+      .map((run) => run.id)
+  );
+  for (const runId of Array.from(state.activeRunIds)) {
+    if (!activeIds.has(runId)) state.activeRunIds.delete(runId);
+  }
 }
 
 function isPendingMessage(message) {
@@ -5046,7 +5317,17 @@ function renderMessageStatusBadge(message, run) {
 
 function renderMessageContent(message) {
   if (isPendingMessage(message) && !String(message.content ?? '').trim()) return 'Thinking...';
+  if (message?.senderType === 'agent') {
+    return stripRepeatedSpeakerPrefix(message.content ?? '', message.senderName);
+  }
   return message.content ?? '';
+}
+
+function stripRepeatedSpeakerPrefix(content, speakerName) {
+  const name = String(speakerName ?? '').trim();
+  if (!name) return String(content ?? '');
+  const escaped = escapeRegExp(name).replace(/\s+/g, '\\s+');
+  return String(content ?? '').trimStart().replace(new RegExp(`^(?:${escaped}\\s*[:：]\\s*)+`, 'i'), '');
 }
 
 function renderMessageBody(message) {
@@ -5463,6 +5744,7 @@ async function api(path, options = {}) {
         passwordSet: true,
         authenticated: false
       };
+      closeEventStream();
       showAuthGate(true);
     }
     throw error;

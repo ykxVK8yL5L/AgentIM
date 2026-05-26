@@ -46,6 +46,54 @@ const CONTINUATION_PLATFORM_ACTIONS = new Set([
   'activity.read',
   'provider.probe'
 ]);
+const eventClients = new Set();
+let nextEventId = 1;
+
+function publishEvent(type, payload = {}) {
+  const event = {
+    id: String(nextEventId++),
+    type,
+    payload,
+    createdAt: new Date().toISOString()
+  };
+  const data = `id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+  for (const client of Array.from(eventClients)) {
+    try {
+      client.enqueue(data);
+    } catch {
+      eventClients.delete(client);
+    }
+  }
+}
+
+function publishRoomEvent(type, roomId, payload = {}) {
+  publishEvent(type, { roomId, ...payload });
+}
+
+function publishMessageEvent(message, type = 'message.updated') {
+  if (!message?.roomId) return;
+  publishRoomEvent(type, message.roomId, {
+    messageId: message.id,
+    senderType: message.senderType,
+    senderName: message.senderName,
+    status: message.status,
+    pending: Boolean(message.pending)
+  });
+}
+
+function publishRunEvent(run, type = 'agent_run.updated') {
+  if (!run?.roomId) return;
+  publishRoomEvent(type, run.roomId, {
+    runId: run.id,
+    agentId: run.agentId,
+    messageId: run.messageId,
+    status: run.status
+  });
+}
+
+function publishResourceEvent(type, payload = {}) {
+  publishEvent(type, payload);
+}
 
 async function requiresAuth(c, store) {
   const path = new URL(c.req.url).pathname;
@@ -247,6 +295,40 @@ app.get('/api/bootstrap', async (c) => {
     ...boot,
     settings: publicSettings(boot.settings, c),
     providers: boot.providers.map(publicProvider)
+  });
+});
+
+app.get('/api/events', async () => {
+  const encoder = new TextEncoder();
+  let heartbeat;
+  let client;
+  const stream = new ReadableStream({
+    start(controller) {
+      client = {
+        enqueue: (chunk) => controller.enqueue(encoder.encode(chunk))
+      };
+      eventClients.add(client);
+      controller.enqueue(encoder.encode(`event: ready\ndata: ${JSON.stringify({ ok: true, createdAt: new Date().toISOString() })}\n\n`));
+      heartbeat = setInterval(() => {
+        try {
+          controller.enqueue(encoder.encode(`event: heartbeat\ndata: ${JSON.stringify({ createdAt: new Date().toISOString() })}\n\n`));
+        } catch {
+          clearInterval(heartbeat);
+          eventClients.delete(client);
+        }
+      }, 25000);
+    },
+    cancel() {
+      clearInterval(heartbeat);
+      if (client) eventClients.delete(client);
+    }
+  });
+  return new Response(stream, {
+    headers: {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache, no-transform',
+      connection: 'keep-alive'
+    }
   });
 });
 
@@ -624,6 +706,7 @@ app.post('/api/agent-templates/:id/create-agent', async (c) => {
     await store.attachAgentToRoom(String(input.roomId), agent.id, { triggerMode: 'manual' });
   }
 
+  publishResourceEvent('agent.created', { agentId: agent.id, roleId: role.id, roomId: input.roomId ? String(input.roomId) : undefined });
   return c.json({ agent, role, template }, 201);
 });
 
@@ -728,6 +811,7 @@ app.post('/api/room-templates/:id/create-room', async (c) => {
     name: `${room.name} Workspace`
   });
 
+  publishResourceEvent('room.created', { roomId: room.id, agentIds: agents.map((agent) => agent.id), roleIds: roles.map((role) => role.id) });
   return c.json({
     room,
     agents,
@@ -906,6 +990,7 @@ app.post('/api/roles', async (c) => {
     systemPrompt: String(input.systemPrompt ?? '').trim(),
     skillIds: normalizeSkillIdsInput(input.skillIds)
   });
+  publishResourceEvent('role.created', { roleId: role.id });
   return c.json(role, 201);
 });
 
@@ -922,6 +1007,7 @@ app.patch('/api/roles/:id', async (c) => {
     systemPrompt: String(input.systemPrompt ?? current.systemPrompt ?? '').trim(),
     skillIds: input.skillIds === undefined ? current.skillIds ?? [] : normalizeSkillIdsInput(input.skillIds)
   });
+  publishResourceEvent('role.updated', { roleId: role.id });
   return c.json(role);
 });
 
@@ -931,6 +1017,7 @@ app.delete('/api/roles/:id', async (c) => {
   if (!role) return c.json({ ok: false, error: 'role_not_found' }, 404);
   if (role.system) return c.json({ ok: false, error: 'system_role_cannot_be_deleted' }, 400);
   await store.deleteRole(role.id);
+  publishResourceEvent('role.deleted', { roleId: role.id });
   return c.json({ ok: true });
 });
 
@@ -963,6 +1050,7 @@ app.post('/api/agents', async (c) => {
     await store.attachAgentToRoom(input.roomId, agent.id, { triggerMode: 'manual' });
   }
 
+  publishResourceEvent('agent.created', { agentId: agent.id, roomId: input.roomId ? String(input.roomId) : undefined });
   return c.json(agent, 201);
 });
 
@@ -991,6 +1079,7 @@ app.patch('/api/agents/:id', async (c) => {
     model,
     status: input.status ?? current.status ?? 'online'
   });
+  publishResourceEvent('agent.updated', { agentId: agent.id });
   return c.json(agent);
 });
 
@@ -1017,6 +1106,7 @@ app.delete('/api/agents/:id', async (c) => {
   const agent = await store.getAgent(c.req.param('id'));
   if (!agent) return c.json({ ok: false, error: 'agent_not_found' }, 404);
   await store.deleteAgent(agent.id);
+  publishResourceEvent('agent.deleted', { agentId: agent.id });
   return c.json({ ok: true });
 });
 
@@ -1075,12 +1165,14 @@ app.post('/api/rooms', async (c) => {
   if (!name) return c.json({ ok: false, error: 'name_required' }, 400);
   const existing = await findRoomByName(store, name, input.type);
   if (existing) return c.json({ ok: false, error: 'room_name_exists', room: existing }, 409);
-  return c.json(await store.createRoom({
+  const room = await store.createRoom({
     name,
     type: input.type,
     description: String(input.description ?? ''),
     dmAgentId: input.dmAgentId ? String(input.dmAgentId) : undefined
-  }), 201);
+  });
+  publishResourceEvent('room.created', { roomId: room.id });
+  return c.json(room, 201);
 });
 
 app.patch('/api/rooms/:id', async (c) => {
@@ -1094,12 +1186,14 @@ app.patch('/api/rooms/:id', async (c) => {
   const duplicate = await findRoomByName(store, name, input.type ?? current.type);
   if (duplicate && duplicate.id !== current.id) return c.json({ ok: false, error: 'room_name_exists', room: duplicate }, 409);
 
-  return c.json(await store.updateRoom(current.id, {
+  const room = await store.updateRoom(current.id, {
     name,
     type: input.type ?? current.type,
     description: String(input.description ?? current.description ?? ''),
     dmAgentId: input.dmAgentId ? String(input.dmAgentId) : current.dmAgentId
-  }));
+  });
+  publishResourceEvent('room.updated', { roomId: room.id });
+  return c.json(room);
 });
 
 app.delete('/api/rooms/:id', async (c) => {
@@ -1107,6 +1201,7 @@ app.delete('/api/rooms/:id', async (c) => {
   const room = await store.getRoom(c.req.param('id'));
   if (!room) return c.json({ ok: false, error: 'room_not_found' }, 404);
   await store.deleteRoom(room.id);
+  publishResourceEvent('room.deleted', { roomId: room.id });
   return c.json({ ok: true });
 });
 
@@ -1121,12 +1216,14 @@ app.post('/api/conversations', async (c) => {
   const name = String(input.name ?? 'New Conversation').trim();
   const existing = await findRoomByName(store, name, input.type);
   if (existing) return c.json({ ok: false, error: 'room_name_exists', room: existing }, 409);
-  return c.json(await store.createRoom({
+  const room = await store.createRoom({
     name,
     type: input.type,
     description: String(input.description ?? ''),
     dmAgentId: input.dmAgentId ? String(input.dmAgentId) : undefined
-  }), 201);
+  });
+  publishResourceEvent('room.created', { roomId: room.id });
+  return c.json(room, 201);
 });
 
 app.get('/api/rooms/:roomId/agents', async (c) => {
@@ -1352,12 +1449,17 @@ app.post('/api/rooms/:roomId/agents', async (c) => {
   if (!room) return c.json({ ok: false, error: 'room_not_found' }, 404);
   const agent = await store.getAgent(input.agentId);
   if (!agent) return c.json({ ok: false, error: 'agent_not_found' }, 404);
-  return c.json(await store.attachAgentToRoom(roomId, agent.id, input), 201);
+  const membership = await store.attachAgentToRoom(roomId, agent.id, input);
+  publishResourceEvent('room.members.updated', { roomId, agentId: agent.id });
+  return c.json(membership, 201);
 });
 
 app.delete('/api/rooms/:roomId/agents/:agentId', async (c) => {
   const store = c.get('store');
-  await store.detachAgentFromRoom(c.req.param('roomId'), c.req.param('agentId'));
+  const roomId = c.req.param('roomId');
+  const agentId = c.req.param('agentId');
+  await store.detachAgentFromRoom(roomId, agentId);
+  publishResourceEvent('room.members.updated', { roomId, agentId });
   return c.json({ ok: true });
 });
 
@@ -1377,20 +1479,32 @@ app.post('/api/rooms/:roomId/dispatch', async (c) => {
       ?? roomAgents[0]
       ?? (room.dmAgentId ? await store.getAgent(room.dmAgentId) : null)
     : null;
+  const explicitTargetIds = Array.isArray(input.targetAgentIds)
+    ? input.targetAgentIds.map((id) => String(id ?? '').trim()).filter(Boolean)
+    : [];
+  const explicitTargets = explicitTargetIds.length > 0
+    ? roomAgents.filter((agent) => explicitTargetIds.includes(agent.id))
+    : [];
   const targets = room.type === 'dm'
     ? directTarget ? [directTarget] : []
-    : resolveMentionTargets(content, roomAgents);
+    : input.targetAll
+      ? uniqueAgents(roomAgents)
+      : explicitTargets.length > 0
+        ? uniqueAgents(explicitTargets)
+        : resolveMentionTargets(content, roomAgents);
   if (targets.length === 0) {
     if (room.type === 'dm' && directTarget) {
+      const message = await store.createMessage({
+        roomId,
+        senderType: 'user',
+        senderName: String(input.senderName ?? 'You'),
+        content,
+        replyTo: await resolveReplyTo(store, roomId, input.replyToMessageId)
+      });
+      publishMessageEvent(message, 'message.created');
       return c.json({
         ok: true,
-        message: await store.createMessage({
-          roomId,
-          senderType: 'user',
-          senderName: String(input.senderName ?? 'You'),
-          content,
-          replyTo: await resolveReplyTo(store, roomId, input.replyToMessageId)
-        }),
+        message,
         targets: [directTarget].map((agent) => ({
           id: agent.id,
           name: agent.name,
@@ -1413,6 +1527,7 @@ app.post('/api/rooms/:roomId/dispatch', async (c) => {
     content,
     replyTo
   });
+  publishMessageEvent(message, 'message.created');
 
   return c.json({
     ok: true,
@@ -1830,14 +1945,16 @@ app.post('/api/agent-runs/:id/stop', async (c) => {
   if (run.messageId) {
     const messages = await store.listMessages(run.roomId);
     const message = messages.find((item) => item.id === run.messageId);
-    await store.updateMessage(run.messageId, {
+    const stoppedMessage = await store.updateMessage(run.messageId, {
       status: 'stopped',
       pending: false,
       content: message?.content && message.content !== 'Thinking...'
         ? `${message.content}\n\n[Stopped by user]`
         : 'Stopped by user.'
     });
+    publishMessageEvent(stoppedMessage);
   }
+  publishRunEvent(stoppedRun);
   return c.json({ ok: true, run: stoppedRun });
 });
 
@@ -1872,6 +1989,8 @@ app.post('/api/agent-runs/:id/retry', async (c) => {
     : null;
 
   enqueueAgentRun(store, run.id);
+  publishRunEvent(retriedRun);
+  if (message) publishMessageEvent(message);
   return c.json({ ok: true, run: retriedRun, message }, 202);
 });
 
@@ -1882,7 +2001,7 @@ app.post('/api/rooms/:roomId/agent-runs/stop', async (c) => {
   for (const run of runs) {
     queuedAgentRunIds.delete(run.id);
     stopRunningAgentRun(run.id);
-    await store.updateAgentRun(run.id, {
+    const stoppedRun = await store.updateAgentRun(run.id, {
       status: 'stopped',
       stoppedAt: new Date().toISOString()
     });
@@ -1891,14 +2010,16 @@ app.post('/api/rooms/:roomId/agent-runs/stop', async (c) => {
     if (run.messageId) {
       const messages = await store.listMessages(roomId);
       const message = messages.find((item) => item.id === run.messageId);
-      await store.updateMessage(run.messageId, {
+      const stoppedMessage = await store.updateMessage(run.messageId, {
         status: 'stopped',
         pending: false,
         content: message?.content && message.content !== 'Thinking...'
           ? `${message.content}\n\n[Stopped by user]`
           : 'Stopped by user.'
       });
+      publishMessageEvent(stoppedMessage);
     }
+    publishRunEvent(stoppedRun);
   }
   return c.json({ ok: true, stopped: runs.length });
 });
@@ -2452,6 +2573,8 @@ async function createAndStartAgentRun(store, roomId, agentId, options = {}) {
   });
 
   enqueueAgentRun(store, run.id);
+  publishMessageEvent(linkedMessage, 'message.created');
+  publishRunEvent(run, 'agent_run.created');
 
   return { ok: true, run, message: linkedMessage };
 }
@@ -2460,17 +2583,19 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
   const run = await store.getAgentRun(runId);
   if (!run || run.status === 'stopped') return;
 
-  await store.updateAgentRun(run.id, {
+  const runningRun = await store.updateAgentRun(run.id, {
     status: 'running',
     attempts: Number(run.attempts ?? 0) + 1,
     lastAttemptAt: new Date().toISOString(),
     startedAt: new Date().toISOString()
   });
-  await store.updateMessage(run.messageId, {
+  const runningMessage = await store.updateMessage(run.messageId, {
     status: 'running',
     pending: true,
     content: 'Thinking...'
   });
+  publishRunEvent(runningRun);
+  publishMessageEvent(runningMessage);
 
   const agent = await store.getAgent(run.agentId);
   if (!agent) {
@@ -2658,18 +2783,19 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
 
     if (signal.aborted || await isAgentRunStopped(store, run.id)) return;
 
-    content = content || formatEmptyProviderResponse(providerDiagnostics);
+    content = stripRepeatedSpeakerPrefix(content || formatEmptyProviderResponse(providerDiagnostics), agent.name);
     const webReads = await applyWebReadActions(store, run, content, signal);
     if (webReads.length > 0) {
       const webReadText = formatWebReadResults(webReads);
       content = `${content}\n\n${webReadText}`;
+      content = stripRepeatedSpeakerPrefix(content, agent.name);
       await store.updateMessage(run.messageId, {
         content,
         status: 'running',
         pending: true
       });
       if (provider.baseUrl !== 'mock://provider') {
-        content = await continueAgentAfterToolResults(store, run, {
+        content = stripRepeatedSpeakerPrefix(await continueAgentAfterToolResults(store, run, {
           agent,
           provider,
           messages: providerMessages,
@@ -2677,19 +2803,20 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
           toolResultText: webReadText,
           providerDiagnostics,
           signal
-        });
+        }), agent.name);
       }
     }
     const workspaceReads = await applyWorkspaceReadActions(store, run, content, workspaceScope);
     if (workspaceReads.length > 0) {
       content = `${content}\n\n${formatWorkspaceReadResults(workspaceReads)}`;
+      content = stripRepeatedSpeakerPrefix(content, agent.name);
       await store.updateMessage(run.messageId, {
         content,
         status: 'running',
         pending: true
       });
       if (provider.baseUrl !== 'mock://provider') {
-        content = await continueAgentAfterToolResults(store, run, {
+        content = stripRepeatedSpeakerPrefix(await continueAgentAfterToolResults(store, run, {
           agent,
           provider,
           messages: providerMessages,
@@ -2697,7 +2824,7 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
           toolResultText: formatWorkspaceReadResults(workspaceReads),
           providerDiagnostics,
           signal
-        });
+        }), agent.name);
       }
     }
     const workspaceActions = await applyWorkspaceActions(store, run, content, workspaceScope);
@@ -2745,7 +2872,7 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
         pending: false
       });
       if (provider.baseUrl !== 'mock://provider' && platformActionsShouldContinue(platformActions)) {
-        content = await continueAgentAfterToolResults(store, run, {
+        content = stripRepeatedSpeakerPrefix(await continueAgentAfterToolResults(store, run, {
           agent,
           provider,
           messages: providerMessages,
@@ -2753,7 +2880,7 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
           toolResultText: formatPlatformActionResults(platformActions),
           providerDiagnostics,
           signal
-        });
+        }), agent.name);
         const followupRoomMessages = await applyRoomMessageActions(store, run, content, workspaceScope);
         if (followupRoomMessages.length > 0) {
           await store.createMessage({
@@ -2817,29 +2944,33 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
       });
     }
 
-    await store.updateMessage(run.messageId, {
+    const doneMessage = await store.updateMessage(run.messageId, {
       content,
       status: 'done',
       pending: false
     });
-    await store.updateAgentRun(run.id, {
+    const doneRun = await store.updateAgentRun(run.id, {
       status: 'done',
       completedAt: new Date().toISOString()
     });
+    publishMessageEvent(doneMessage);
+    publishRunEvent(doneRun);
     await completeScheduledTaskForRun(store, run.id, 'done');
     await completeProjectTaskForRun(store, run, 'done', undefined, content);
     await startMentionedAgentRuns(store, run, content);
   } catch (error) {
     if ((signal.aborted && running?.abortReason === AGENT_RUN_ABORT_STOP) || error?.message === 'agent_run_stopped') {
-      await store.updateAgentRun(run.id, {
+      const stoppedRun = await store.updateAgentRun(run.id, {
         status: 'stopped',
         stoppedAt: new Date().toISOString()
       });
-      await store.updateMessage(run.messageId, {
+      const stoppedMessage = await store.updateMessage(run.messageId, {
         content: content || 'Stopped by user.',
         status: 'stopped',
         pending: false
       });
+      publishRunEvent(stoppedRun);
+      publishMessageEvent(stoppedMessage);
       await completeScheduledTaskForRun(store, run.id, 'failed', 'agent_run_stopped');
       await completeProjectTaskForRun(store, run, 'failed', 'agent_run_stopped', content);
       return;
@@ -3037,18 +3168,20 @@ async function startMentionedAgentRuns(store, run, content) {
 }
 
 async function failAgentRun(store, run, error, partialContent = '') {
-  await store.updateAgentRun(run.id, {
+  const failedRun = await store.updateAgentRun(run.id, {
     status: 'failed',
     error,
     completedAt: new Date().toISOString()
   });
-  await store.updateMessage(run.messageId, {
+  const failedMessage = await store.updateMessage(run.messageId, {
     content: partialContent
       ? `${partialContent}\n\n[Provider error: ${error}]`
       : `Provider error: ${error}`,
     status: 'failed',
     pending: false
   });
+  publishRunEvent(failedRun);
+  publishMessageEvent(failedMessage);
   await completeScheduledTaskForRun(store, run.id, 'failed', error);
   await completeProjectTaskForRun(store, run, 'failed', error, partialContent);
 }
@@ -3725,6 +3858,7 @@ async function applyRoomMessageActions(store, run, content, workspaceScope) {
           content: `Cross-room message from ${sourceRoomName}`
         }
       });
+      publishMessageEvent(message, 'message.created');
       await store.updateSkillInvocation(invocation.id, {
         status: 'done',
         output: {
@@ -4655,6 +4789,10 @@ async function applyRoomManagementActions(store, run, content, workspaceScope) {
       await store.getOrCreateRoomWorkspace(room.id, {
         name: `${room.name} Workspace`
       });
+      publishResourceEvent('room.created', {
+        roomId: room.id,
+        agentIds: joins.map(({ agent }) => agent.id)
+      });
       await store.updateSkillInvocation(invocation.id, {
         status: 'done',
         output: {
@@ -4703,6 +4841,10 @@ async function applyRoomManagementActions(store, run, content, workspaceScope) {
           agentName: targetAgent.name
         });
       }
+      publishResourceEvent('room.members.updated', {
+        roomId: room.id,
+        agentIds: joins.map(({ agent }) => agent.id)
+      });
       await store.updateSkillInvocation(invocation.id, {
         status: 'done',
         output: {
@@ -5581,7 +5723,19 @@ function formatMessageForContext(message, context = {}) {
   const replyContext = message.replyTo && !isInternalProviderErrorContent(message.replyTo.content)
     ? ` (replying to ${message.replyTo.senderName}: ${message.replyTo.content})`
     : '';
-  return `${message.senderName}${replyContext}: ${formatMessageContentForContext(message, context)}`;
+  const content = formatMessageContentForContext(message, context);
+  if (message.senderType === 'agent') {
+    return `${message.senderName}${replyContext}: ${stripRepeatedSpeakerPrefix(content, message.senderName)}`;
+  }
+  return `${message.senderName}${replyContext}: ${content}`;
+}
+
+function stripRepeatedSpeakerPrefix(content, speakerName) {
+  let next = String(content ?? '').trimStart();
+  const name = String(speakerName ?? '').trim();
+  if (!name) return next;
+  const prefixPattern = new RegExp(`^(?:${escapeRegExp(name)}\\s*[:：]\\s*)+`, 'i');
+  return next.replace(prefixPattern, '').trimStart();
 }
 
 function formatMessageContentForContext(message, context = {}) {
@@ -6260,14 +6414,11 @@ function resolveAgentRole(agent) {
 }
 
 function resolveMentionTargets(content, agents) {
-  const tokens = Array.from(content.matchAll(/@([^\s@]+)/g))
-    .map((match) => normalizeMention(match[1]));
-  if (tokens.includes('all')) return uniqueAgents(agents);
-
   const targets = [];
-  for (const token of tokens) {
-    const agent = agents.find((item) => normalizeMention(item.name) === token);
-    if (agent) targets.push(agent);
+  if (mentionMatchesName(content, 'all')) return uniqueAgents(agents);
+
+  for (const agent of agents) {
+    if (mentionMatchesName(content, agent.name)) targets.push(agent);
   }
   return uniqueAgents(targets);
 }
@@ -6286,6 +6437,13 @@ function normalizeMention(value) {
     .trim()
     .replace(/[，。！？、,.!?:;；：）)\]}]+$/g, '')
     .toLowerCase();
+}
+
+function mentionMatchesName(content, name) {
+  const escaped = escapeRegExp(String(name ?? '').trim()).replace(/\s+/g, '\\s+');
+  if (!escaped) return false;
+  return new RegExp(`(^|\\s)@${escaped}(?=$|[\\s，。！？、,.!?:;；：）)\\]}])`, 'i')
+    .test(String(content ?? ''));
 }
 
 function normalizeProviderTimeoutInput(value) {
