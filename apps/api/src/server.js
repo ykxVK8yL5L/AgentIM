@@ -7,7 +7,7 @@ import { app } from './app.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const webRoot = path.resolve(__dirname, '../../web/public');
 const port = Number(process.env.PORT ?? 8787);
-const hostname = process.env.HOST ?? '127.0.0.1';
+const hostname = process.env.HOST ?? '0.0.0.0';
 
 app.use('*', serveStatic({
   root: webRoot,

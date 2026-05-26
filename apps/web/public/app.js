@@ -1140,6 +1140,7 @@ function renderRoomTemplates() {
           <details class="template-preview">
             <summary>Preview</summary>
             <div class="template-preview-body">
+              <button type="button" class="circle-sheet-close" data-circle-close-detail>Close</button>
               <p>${escapeHtml(template.roomDescription ?? template.description ?? '')}</p>
               ${template.outcome ? `<p><strong>Outcome:</strong> ${escapeHtml(template.outcome)}</p>` : ''}
               ${Array.isArray(template.slots) && template.slots.length > 0 ? `
@@ -1167,6 +1168,7 @@ function renderRoomTemplates() {
           <details class="circle-config">
             <summary>Configure</summary>
             <div class="circle-config-grid">
+              <button type="button" class="circle-sheet-close" data-circle-close-detail>Close</button>
               <label>
                 Room Name
                 <input name="name" value="${escapeHtml(template.roomName ?? template.name)}" required />
@@ -1205,6 +1207,7 @@ function renderRoomTemplates() {
               </div>
             </div>
           </details>
+          <button type="button" class="circle-sheet-overlay" data-circle-sheet-overlay aria-label="Close circle preview overlay" tabindex="-1"></button>
         </div>
         <div class="entity-actions">
           <button type="submit">Join</button>
@@ -1226,6 +1229,26 @@ function renderRoomTemplates() {
   for (const form of els.roomTemplateList.querySelectorAll('[data-room-template-form]')) {
     renderCircleModelOptions(form, form.elements.providerId?.value);
     syncCircleAgentDefaults(form);
+    for (const detail of form.querySelectorAll('.template-preview, .circle-config')) {
+      detail.addEventListener('toggle', () => {
+        if (!detail.open) return;
+        for (const sibling of form.querySelectorAll('.template-preview, .circle-config')) {
+          if (sibling !== detail) sibling.open = false;
+        }
+      });
+    }
+    for (const closeButton of form.querySelectorAll('[data-circle-close-detail]')) {
+      closeButton.addEventListener('click', () => {
+        closeButton.closest('details')?.removeAttribute('open');
+      });
+    }
+    for (const overlay of form.querySelectorAll('[data-circle-sheet-overlay]')) {
+      overlay.addEventListener('click', () => {
+        for (const detail of form.querySelectorAll('.template-preview, .circle-config')) {
+          detail.removeAttribute('open');
+        }
+      });
+    }
     form.querySelector('[data-circle-model]')?.addEventListener('change', () => syncCircleAgentDefaults(form, { onlyMatchingPrevious: true }));
     for (const agentProvider of form.querySelectorAll('[data-circle-agent-provider]')) {
       agentProvider.addEventListener('change', () => {

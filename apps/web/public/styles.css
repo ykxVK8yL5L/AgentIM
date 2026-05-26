@@ -642,11 +642,16 @@ button.entity-main {
 }
 
 .circle-create-card {
+  position: relative;
   align-content: start;
   grid-template-rows: minmax(0, 1fr) auto;
   gap: 14px;
   overflow: visible;
   padding: 22px;
+}
+
+.circle-create-card:has(.template-preview[open], .circle-config[open]) {
+  z-index: 20;
 }
 
 .circle-create-card .entity-main {
@@ -719,12 +724,22 @@ button.entity-main {
   gap: 8px;
 }
 
-.template-preview summary {
+.template-preview summary,
+.circle-config summary {
   width: max-content;
   cursor: pointer;
-  color: var(--accent);
+  list-style: none;
   font-size: 12px;
   font-weight: 850;
+}
+
+.template-preview summary {
+  color: var(--accent);
+}
+
+.template-preview summary::-webkit-details-marker,
+.circle-config summary::-webkit-details-marker {
+  display: none;
 }
 
 .template-preview-body {
@@ -807,11 +822,51 @@ button.entity-main {
 }
 
 .circle-config summary {
-  width: max-content;
-  cursor: pointer;
   color: var(--text);
-  font-size: 12px;
-  font-weight: 850;
+}
+
+.template-preview[open] .template-preview-body,
+.circle-config[open] .circle-config-grid {
+  position: absolute;
+  left: 16px;
+  right: 16px;
+  z-index: 15;
+  margin-top: 8px;
+  max-height: min(430px, calc(100vh - 220px));
+  overflow: auto;
+  box-shadow: 0 18px 46px rgba(20, 28, 45, 0.16);
+}
+
+.template-preview[open] .template-preview-body {
+  border-color: rgba(15, 123, 108, 0.2);
+  background: rgba(250, 255, 253, 0.98);
+}
+
+.circle-config[open] .circle-config-grid {
+  display: grid;
+  gap: 10px;
+  border: 1px solid rgba(20, 28, 45, 0.08);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.98);
+  padding: 10px;
+}
+
+.circle-sheet-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  width: 100vw;
+  height: 100dvh;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  background: rgba(10, 14, 24, 0.22);
+  cursor: pointer;
+}
+
+.circle-sheet-close {
+  display: none;
 }
 
 .circle-config-grid {
@@ -834,12 +889,10 @@ button.entity-main {
 
 .circle-agent-row {
   display: grid;
-  grid-template-columns: minmax(130px, 1fr) minmax(120px, 0.8fr) minmax(
-      120px,
-      0.8fr
-    );
+  grid-template-columns: 1fr;
   gap: 8px;
   align-items: center;
+  min-width: 0;
 }
 
 .circle-agent-picker label,
@@ -858,6 +911,8 @@ button.entity-main {
 }
 
 .circle-agent-row select {
+  width: 100%;
+  min-width: 0;
   min-height: 32px;
   padding: 6px 8px;
   font-size: 12px;
@@ -3333,6 +3388,49 @@ button.inspector-section-title[type="button"]::before {
 
   .app-shell.management-mode #room-template-list {
     margin-bottom: calc(48px + var(--mobile-safe-bottom));
+  }
+
+  .app-shell.management-mode .template-preview[open] .template-preview-body,
+  .app-shell.management-mode .circle-config[open] .circle-config-grid {
+    position: fixed;
+    left: 12px;
+    right: 12px;
+    top: calc(var(--mobile-topbar) + 12px);
+    bottom: calc(var(--mobile-nav) + var(--mobile-safe-bottom) + 12px);
+    z-index: 80;
+    margin-top: 0;
+    max-height: none;
+    overflow: auto;
+    border-radius: 14px;
+    padding: 12px;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .app-shell.management-mode .circle-config[open] .circle-config-grid {
+    padding-bottom: calc(12px + env(safe-area-inset-bottom));
+  }
+
+  .app-shell.management-mode .circle-sheet-close {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    display: block;
+    margin: 0 0 10px auto;
+    min-height: 30px;
+    border-radius: 999px;
+    padding: 6px 10px;
+    background: var(--rail);
+    color: #fff;
+    font-size: 11px;
+  }
+
+  .app-shell.management-mode .circle-sheet-close + * {
+    margin-top: 0;
+  }
+
+  .app-shell.management-mode .circle-create-card:has(.template-preview[open], .circle-config[open]) .circle-sheet-overlay {
+    display: block;
+    z-index: 75;
   }
 
   .app-shell.management-mode
