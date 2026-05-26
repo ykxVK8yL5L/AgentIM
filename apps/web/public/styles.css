@@ -642,10 +642,16 @@ button.entity-main {
 }
 
 .circle-create-card {
-  min-height: 292px;
-  align-content: space-between;
+  align-content: start;
+  grid-template-rows: minmax(0, 1fr) auto;
   gap: 14px;
+  overflow: visible;
   padding: 22px;
+}
+
+.circle-create-card .entity-main {
+  gap: 10px;
+  min-width: 0;
 }
 
 .circle-create-card .entity-actions {
@@ -657,29 +663,35 @@ button.entity-main {
 }
 
 .circle-card-heading {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 10px;
-  align-items: start;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 10px;
+  align-items: flex-start;
+  min-width: 0;
 }
 
 .circle-card-heading strong {
+  flex: 1 1 160px;
+  min-width: 0;
   font-size: 17px;
+  line-height: 1.25;
   letter-spacing: -0.01em;
 }
 
 .circle-card-heading span {
-  justify-self: end;
+  flex: 0 1 auto;
+  max-width: 100%;
   border-radius: 999px;
   background: var(--accent-soft);
   color: var(--accent-ink);
   font-size: 11px;
   font-weight: 850;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
   padding: 4px 8px;
 }
 
 .circle-card-description {
-  min-height: 74px;
   margin: 0;
   color: var(--muted);
   font-size: 12px;
@@ -690,6 +702,7 @@ button.entity-main {
 .circle-card-meta {
   display: grid;
   gap: 4px;
+  min-width: 0;
   border-top: 1px solid rgba(17, 24, 39, 0.06);
   padding-top: 8px;
 }
@@ -697,6 +710,7 @@ button.entity-main {
 .circle-card-meta span {
   color: var(--muted);
   font-size: 12px;
+  line-height: 1.35;
   overflow-wrap: anywhere;
 }
 
@@ -730,6 +744,44 @@ button.entity-main {
   font-size: 12px;
   line-height: 1.5;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.circle-slot-list,
+.circle-workflow-list {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.circle-slot-item,
+.circle-workflow-list span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  border: 1px solid rgba(20, 28, 45, 0.08);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.82);
+  padding: 6px 7px;
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.circle-slot-item.required {
+  border-color: rgba(15, 123, 108, 0.22);
+}
+
+.circle-slot-item strong {
+  font-size: 12px;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.circle-slot-item span,
+.circle-workflow-list span {
+  color: var(--muted);
+  line-height: 1.35;
   overflow-wrap: anywhere;
 }
 
@@ -2647,7 +2699,7 @@ button.inspector-section-title[type="button"]::before {
 }
 
 .app-shell.management-mode [data-app-section-panel="circles"].active {
-  grid-template-rows: auto auto auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto auto auto;
 }
 
 .app-shell.management-mode [data-app-section-panel="circles"] .circle-builder {
@@ -2943,7 +2995,6 @@ button.inspector-section-title[type="button"]::before {
   }
 
   .app-shell.management-mode .section-tabs,
-  .app-shell.management-mode .section-tab-panel.active,
   .app-shell.management-mode [data-app-section-panel="circles"] .circle-builder,
   .app-shell.management-mode [data-app-section-panel="circles"] > .search-field,
   .app-shell.management-mode
@@ -2951,6 +3002,18 @@ button.inspector-section-title[type="button"]::before {
     > .filter-select,
   .app-shell.management-mode #room-template-list {
     width: calc(100% - 32px);
+    margin-left: 16px;
+    margin-right: 16px;
+  }
+
+  .app-shell.management-mode .section-tabs {
+    margin-top: 18px;
+  }
+
+  .app-shell.management-mode .section-tab-panel.active {
+    width: 100%;
+    padding-left: 16px;
+    padding-right: 16px;
   }
 
   .app-shell.management-mode [data-section-panel="resources:project"].active,
@@ -3463,6 +3526,63 @@ button.inspector-section-title[type="button"]::before {
 
   .mobile-tabbar {
     display: none;
+  }
+}
+
+@media (min-width: 761px) and (max-width: 900px) {
+  .app-shell:not(.management-mode) .chat.app-pane.active {
+    display: grid;
+    grid-template-rows: minmax(0, 1fr) auto;
+    height: calc(100dvh - 116px);
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .app-shell:not(.management-mode) .chat.app-pane.active .chat-body {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .app-shell:not(.management-mode) .chat.app-pane.active .messages {
+    height: 100%;
+    min-height: 0;
+    overflow: auto;
+    padding: 14px 12px 18px;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .app-shell:not(.management-mode) .chat.app-pane.active .composer {
+    margin: 0;
+    border-right: 0;
+    border-bottom: 0;
+    border-left: 0;
+    border-radius: 16px 16px 0 0;
+    padding: 12px;
+    box-shadow: 0 -14px 34px rgba(20, 28, 45, 0.08);
+  }
+
+  .app-shell.management-mode .section-tabs,
+  .app-shell.management-mode [data-app-section-panel="circles"] .circle-builder,
+  .app-shell.management-mode [data-app-section-panel="circles"] > .search-field,
+  .app-shell.management-mode
+    [data-app-section-panel="circles"]
+    > .filter-select,
+  .app-shell.management-mode #room-template-list {
+    width: calc(100% - 32px);
+    max-width: none;
+    margin-left: 16px;
+    margin-right: 16px;
+  }
+
+  .app-shell.management-mode .section-tab-panel.active {
+    width: 100%;
+    max-width: none;
+    margin-left: 0;
+    margin-right: 0;
+    padding-left: 16px;
+    padding-right: 16px;
   }
 }
 body.auth-locked {

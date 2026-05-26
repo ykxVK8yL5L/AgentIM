@@ -141,6 +141,90 @@ function slugify(value) {
   return slug || `circle-${Date.now()}`;
 }
 
+function normalizeCircleSlots(template) {
+  return Array.isArray(template?.slots)
+    ? template.slots
+      .map((slot) => ({
+        id: String(slot.id ?? '').trim(),
+        label: String(slot.label ?? slot.id ?? '').trim(),
+        roleId: String(slot.roleId ?? '').trim(),
+        agentTemplateId: String(slot.agentTemplateId ?? '').trim(),
+        description: String(slot.description ?? '').trim(),
+        required: Boolean(slot.required)
+      }))
+      .filter((slot) => slot.id && slot.agentTemplateId)
+    : [];
+}
+
+function resolveCircleSelectedAgents(template, requestedAgents, defaults) {
+  const selected = [];
+  const byTemplateId = new Map();
+  for (const agent of requestedAgents) {
+    if (!agent.templateId || byTemplateId.has(agent.templateId)) continue;
+    const slot = normalizeCircleSlots(template).find((item) => item.agentTemplateId === agent.templateId);
+    const next = {
+      ...agent,
+      slotId: slot?.id,
+      slotLabel: slot?.label,
+      roleId: slot?.roleId,
+      required: Boolean(slot?.required),
+      autoAdded: false
+    };
+    byTemplateId.set(agent.templateId, next);
+    selected.push(next);
+  }
+  if (template.autoCreateRequiredAgents !== false) {
+    for (const slot of normalizeCircleSlots(template).filter((item) => item.required)) {
+      if (byTemplateId.has(slot.agentTemplateId)) continue;
+      const next = {
+        templateId: slot.agentTemplateId,
+        providerId: defaults.defaultProviderId,
+        model: defaults.defaultModel,
+        slotId: slot.id,
+        slotLabel: slot.label,
+        roleId: slot.roleId,
+        required: true,
+        autoAdded: true
+      };
+      byTemplateId.set(slot.agentTemplateId, next);
+      selected.push(next);
+    }
+  }
+  return selected;
+}
+
+function buildCircleRoomDescription(template, overrideDescription) {
+  const description = String(overrideDescription ?? template.roomDescription ?? template.description ?? '').trim();
+  const slots = normalizeCircleSlots(template);
+  const slotLines = slots.length > 0
+    ? [
+      '',
+      'Team slots:',
+      ...slots.map((slot) => `- ${slot.required ? 'Required' : 'Optional'} ${slot.label}: ${slot.description || slot.roleId}`)
+    ]
+    : [];
+  const workflow = template.workflow?.steps?.length
+    ? [
+      '',
+      'Workflow:',
+      ...template.workflow.steps.map((step, index) => `${index + 1}. ${step.title}${step.dependsOn?.length ? ` (after ${step.dependsOn.join(', ')})` : ''}`)
+    ]
+    : [];
+  const rules = [
+    template.collaborationMode ? `Collaboration mode: ${template.collaborationMode}` : '',
+    template.outcome ? `Expected outcome: ${template.outcome}` : '',
+    template.workflow?.allowUserFeedbackInterrupts ? 'User feedback can interrupt, supersede, or revise active work.' : '',
+    template.workflow?.requirePmApprovalBeforeDevelopment ? 'Development should wait for PM approval of design direction unless @user explicitly overrides.' : '',
+    template.workflow?.maxRevisionRounds ? `Suggested max revision rounds: ${template.workflow.maxRevisionRounds}.` : ''
+  ].filter(Boolean);
+  return [
+    description,
+    rules.length > 0 ? ['', 'Circle rules:', ...rules.map((rule) => `- ${rule}`)].join('\n') : '',
+    slotLines.join('\n'),
+    workflow.join('\n')
+  ].filter(Boolean).join('\n');
+}
+
 app.use('/api/*', async (c, next) => {
   const store = await createStore(c);
   c.set('store', store);
@@ -431,7 +515,12 @@ app.get('/api/room-templates', async (c) => {
         name: agentTemplate.name,
         category: agentTemplate.category,
         description: agentTemplate.description
-      }))
+      })),
+    slots: normalizeCircleSlots(template),
+    workflow: template.workflow ?? null,
+    collaborationMode: template.collaborationMode,
+    outcome: template.outcome,
+    autoCreateRequiredAgents: template.autoCreateRequiredAgents !== false
   })));
 });
 
@@ -566,7 +655,7 @@ app.post('/api/room-templates/:id/create-room', async (c) => {
     ? input.agentTemplateIds.map((id) => String(id ?? '').trim()).filter(Boolean)
     : [];
   const allowedTemplateIds = new Set(template.agentTemplateIds);
-  const selectedAgents = requestedAgents.length > 0
+  const requestedSelectedAgents = requestedAgents.length > 0
     ? requestedAgents.filter((agent) => allowedTemplateIds.has(agent.templateId))
     : (requestedTemplateIds.length > 0 ? requestedTemplateIds : template.agentTemplateIds)
       .filter((id) => allowedTemplateIds.has(id))
@@ -575,6 +664,10 @@ app.post('/api/room-templates/:id/create-room', async (c) => {
         providerId: defaultProviderId,
         model: defaultModel
       }));
+  const selectedAgents = resolveCircleSelectedAgents(template, requestedSelectedAgents, {
+    defaultProviderId,
+    defaultModel
+  });
   if (selectedAgents.length === 0) return c.json({ ok: false, error: 'agent_templates_required' }, 400);
 
   const providerCache = new Map([[defaultProvider.id, defaultProvider]]);
@@ -589,10 +682,11 @@ app.post('/api/room-templates/:id/create-room', async (c) => {
   const room = await store.createRoom({
     name: roomName,
     type: 'group',
-    description: String(input.description ?? template.roomDescription ?? template.description)
+    description: buildCircleRoomDescription(template, input.description)
   });
   const agents = [];
   const roles = [];
+  const slotAssignments = [];
   for (const selectedAgent of selectedAgents) {
     const agentTemplate = AGENCY_AGENT_TEMPLATES.find((item) => item.id === selectedAgent.templateId);
     if (!agentTemplate) continue;
@@ -615,6 +709,17 @@ app.post('/api/room-templates/:id/create-room', async (c) => {
       roomTemplateId: template.id
     });
     await store.attachAgentToRoom(room.id, agent.id, { triggerMode: 'manual' });
+    if (selectedAgent.slotId) {
+      slotAssignments.push({
+        slotId: selectedAgent.slotId,
+        label: selectedAgent.slotLabel,
+        required: Boolean(selectedAgent.required),
+        roleId: selectedAgent.roleId,
+        agentId: agent.id,
+        agentName: agent.name,
+        templateId: agentTemplate.id
+      });
+    }
     roles.push(role);
     agents.push(agent);
   }
@@ -623,7 +728,19 @@ app.post('/api/room-templates/:id/create-room', async (c) => {
     name: `${room.name} Workspace`
   });
 
-  return c.json({ room, agents, roles, template }, 201);
+  return c.json({
+    room,
+    agents,
+    roles,
+    template,
+    circle: {
+      id: template.id,
+      collaborationMode: template.collaborationMode,
+      workflow: template.workflow ?? null,
+      slots: normalizeCircleSlots(template),
+      slotAssignments
+    }
+  }, 201);
 });
 
 app.get('/api/skills', async (c) => {
@@ -1400,6 +1517,40 @@ app.post('/api/tasks/:id/run-now', async (c) => {
   return c.json(await store.getScheduledTask(task.id), 202);
 });
 
+app.post('/api/tasks/:id/review', async (c) => {
+  const store = c.get('store');
+  const task = await store.getScheduledTask(c.req.param('id'));
+  if (!task) return c.json({ ok: false, error: 'task_not_found' }, 404);
+  const input = await c.req.json();
+  const decision = normalizeReviewDecision(input.decision ?? input.status);
+  if (!decision) return c.json({ ok: false, error: 'invalid_review_decision' }, 400);
+  const reviewed = await store.updateScheduledTask(task.id, {
+    reviewDecision: decision,
+    reviewNotes: String(input.notes ?? '').trim(),
+    status: decision === 'approved' ? 'approved' : 'changes_requested',
+    completedAt: new Date().toISOString()
+  });
+  let revision = null;
+  if (decision === 'changes_requested' && input.revision !== false) {
+    revision = await createRevisionScheduledTask(store, { roomId: task.roomId }, task, input, String(input.notes ?? '').trim());
+    await store.updateScheduledTask(task.id, { supersededByTaskId: revision.id });
+    await dispatchDueScheduledTasks(store);
+  }
+  return c.json({ ok: true, task: await store.getScheduledTask(task.id) ?? reviewed, revision });
+});
+
+app.post('/api/tasks/:id/interrupt', async (c) => {
+  const store = c.get('store');
+  const task = await store.getScheduledTask(c.req.param('id'));
+  if (!task) return c.json({ ok: false, error: 'task_not_found' }, 404);
+  const input = await c.req.json();
+  const result = await interruptScheduledTask(store, { roomId: task.roomId }, {
+    ...input,
+    taskId: task.id
+  });
+  return c.json({ ok: true, ...result });
+});
+
 app.delete('/api/tasks/:id', async (c) => {
   const store = c.get('store');
   const task = await store.getScheduledTask(c.req.param('id'));
@@ -1962,8 +2113,12 @@ async function scheduledTaskDependencyState(store, task) {
     dependencies.push(dependency);
   }
   if (dependencies.some((dependency) => !dependency || dependency.status === 'failed' || dependency.status === 'cancelled')) return 'failed';
-  if (dependencies.every((dependency) => dependency.status === 'done')) return 'ready';
+  if (dependencies.every((dependency) => taskDependencySatisfied(dependency))) return 'ready';
   return 'waiting';
+}
+
+function taskDependencySatisfied(task) {
+  return task && ['done', 'approved'].includes(task.status);
 }
 
 async function runScheduledTask(store, task) {
@@ -2633,6 +2788,17 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
           });
         }
       }
+    }
+    const taskPlanActions = await applyTaskPlanActions(store, run, content);
+    if (taskPlanActions.created.length > 0) {
+      await store.createMessage({
+        roomId: run.roomId,
+        senderType: 'system',
+        senderName: 'AgentIM',
+        content: `Tasks scheduled: ${taskPlanActions.created.map((task) => task.title).join('; ')}.`,
+        status: 'done',
+        pending: false
+      });
     }
     const roomManagementActions = await applyRoomManagementActions(store, run, content, workspaceScope);
     if (roomManagementActions.created.length > 0 || roomManagementActions.assigned.length > 0) {
@@ -3691,6 +3857,280 @@ async function createRoleManagementInvocation(store, run, skillId, input) {
   });
 }
 
+async function applyTaskPlanActions(store, run, content) {
+  const plans = parseTaskPlanBlocks(content);
+  if (plans.length === 0) return { created: [] };
+
+  const agent = await store.getAgent(run.agentId);
+  const skills = await store.listSkills();
+  if (!await agentHasSkill(store, agent, 'task.schedule', skills)) {
+    throw new Error('agent_missing_task_schedule_skill');
+  }
+
+  const room = await store.getRoom(run.roomId);
+  if (!room) throw new Error('room_not_found');
+  const roomAgents = await store.listRoomAgents(run.roomId);
+  const created = [];
+  for (const plan of plans) {
+    const invocation = await createTaskPlanInvocation(store, run, {
+      title: plan.title,
+      itemCount: plan.items.length
+    });
+    try {
+      const createdForPlan = [];
+      const taskIdsByPlanItemId = new Map();
+      for (const item of plan.items) {
+        const targetAgent = resolveTaskPlanAgent(item, roomAgents, agent);
+        if (!targetAgent) throw new Error(`task_plan_agent_not_found:${item.agent || item.role || item.title}`);
+        const dependsOnTaskIds = item.dependsOn
+          .map((dependency) => taskIdsByPlanItemId.get(dependency) ?? dependency)
+          .filter(Boolean);
+        const task = await store.createScheduledTask({
+          roomId: run.roomId,
+          agentId: targetAgent.id,
+          title: item.title,
+          instructions: buildScheduledTaskInstructions(plan, item, {
+            creator: agent,
+            targetAgent,
+            room
+          }),
+          scheduleAt: item.scheduleAt ?? new Date().toISOString(),
+          status: 'scheduled',
+          repeatInterval: item.repeatInterval,
+          dependsOnTaskIds,
+          createdBy: agent?.name ?? 'agent'
+        });
+        createdForPlan.push(task);
+        created.push(task);
+        taskIdsByPlanItemId.set(item.id, task.id);
+      }
+      await store.updateSkillInvocation(invocation.id, {
+        status: 'done',
+        output: {
+          title: plan.title,
+          taskIds: createdForPlan.map((task) => task.id),
+          tasks: createdForPlan.map((task) => ({
+            id: task.id,
+            title: task.title,
+            agentId: task.agentId,
+            dependsOnTaskIds: task.dependsOnTaskIds ?? []
+          }))
+        },
+        completedAt: new Date().toISOString()
+      });
+    } catch (error) {
+      await store.updateSkillInvocation(invocation.id, {
+        status: 'failed',
+        error: error instanceof Error ? error.message : String(error),
+        completedAt: new Date().toISOString()
+      });
+      throw error;
+    }
+  }
+  if (created.length > 0) await dispatchDueScheduledTasks(store);
+  return { created };
+}
+
+async function createTaskPlanInvocation(store, run, input) {
+  return store.createSkillInvocation({
+    skillId: 'task.schedule',
+    roomId: run.roomId,
+    runId: run.id,
+    messageId: run.messageId,
+    agentId: run.agentId,
+    actorType: 'agent',
+    status: 'running',
+    input,
+    startedAt: new Date().toISOString()
+  });
+}
+
+function resolveTaskPlanAgent(item, roomAgents, fallbackAgent) {
+  const requested = String(item.agent ?? '').trim();
+  if (requested) {
+    const exact = roomAgents.find((agent) => agent.id === requested)
+      ?? roomAgents.find((agent) => roomNameMatches(agent.name, requested));
+    if (exact) return exact;
+  }
+  const role = String(item.role ?? item.roleId ?? '').trim();
+  if (role) {
+    const byRole = roomAgents.find((agent) => agent.roleId === role)
+      ?? roomAgents.find((agent) => roomNameMatches(agent.roleId, role));
+    if (byRole) return byRole;
+  }
+  if (fallbackAgent && roomAgents.some((agent) => agent.id === fallbackAgent.id)) return fallbackAgent;
+  return roomAgents[0] ?? null;
+}
+
+function buildScheduledTaskInstructions(plan, item, context) {
+  return [
+    `Task plan: ${plan.title}`,
+    plan.summary ? `Plan summary: ${plan.summary}` : '',
+    `Assigned by: ${context.creator?.name ?? 'Agent'}`,
+    `Assigned to: ${context.targetAgent?.name ?? 'Agent'}`,
+    `Room: ${context.room?.name ?? ''}`,
+    '',
+    item.instructions,
+    '',
+    item.acceptanceCriteria.length > 0 ? `Acceptance criteria:\n${item.acceptanceCriteria.map((line) => `- ${line}`).join('\n')}` : '',
+    item.reviewWith ? `Review with: ${item.reviewWith}` : '',
+    item.artifact ? `Expected artifact: ${item.artifact}` : '',
+    '',
+    'When finished, report what you did, any artifact or workspace paths, open questions, and whether the next dependent task can proceed.'
+  ].filter(Boolean).join('\n');
+}
+
+async function reviewScheduledTask(store, run, input) {
+  const task = await resolveScheduledTask(store, input.taskId ?? input.task ?? input.reviewOfTaskId);
+  if (!task) throw new Error('task_not_found');
+  if (task.roomId !== run.roomId) throw new Error('task_not_in_current_room');
+  const decision = normalizeReviewDecision(input.decision ?? input.status);
+  const notes = String(input.notes ?? input.reason ?? '').trim();
+  if (!decision) throw new Error('invalid_review_decision');
+  const update = {
+    reviewDecision: decision,
+    reviewNotes: notes,
+    status: decision === 'approved' ? 'approved' : 'changes_requested',
+    completedAt: new Date().toISOString()
+  };
+  const reviewed = await store.updateScheduledTask(task.id, update);
+  let revision = null;
+  if (decision === 'changes_requested' && input.revision !== false) {
+    revision = await createRevisionScheduledTask(store, run, task, input, notes);
+    await store.updateScheduledTask(task.id, {
+      supersededByTaskId: revision.id
+    });
+  }
+  await store.createMessage({
+    roomId: run.roomId,
+    senderType: 'system',
+    senderName: 'AgentIM',
+    content: [
+      `Task review: ${reviewed.title}`,
+      `Decision: ${decision}`,
+      notes ? `Notes: ${notes}` : '',
+      revision ? `Revision task: ${revision.title}` : ''
+    ].filter(Boolean).join('\n'),
+    status: 'done',
+    pending: false
+  });
+  if (revision) await dispatchDueScheduledTasks(store);
+  return { task: reviewed, decision, revision };
+}
+
+async function interruptScheduledTask(store, run, input) {
+  const task = await resolveScheduledTask(store, input.taskId ?? input.task);
+  if (!task) throw new Error('task_not_found');
+  if (task.roomId !== run.roomId) throw new Error('task_not_in_current_room');
+  const reason = String(input.reason ?? 'interrupted_by_agent').trim();
+  if (task.runId) {
+    const activeRun = await store.getAgentRun(task.runId);
+    if (activeRun?.status === 'queued' || activeRun?.status === 'running') {
+      queuedAgentRunIds.delete(activeRun.id);
+      stopRunningAgentRun(activeRun.id);
+      await store.updateAgentRun(activeRun.id, {
+        status: 'stopped',
+        error: reason,
+        stoppedAt: new Date().toISOString()
+      });
+      await store.updateMessage(activeRun.messageId, {
+        content: `Interrupted: ${reason}`,
+        status: 'stopped',
+        pending: false
+      });
+    }
+  }
+  const interrupted = await store.updateScheduledTask(task.id, {
+    status: input.supersede === false ? 'interrupted' : 'superseded',
+    error: reason,
+    completedAt: new Date().toISOString()
+  });
+  let replacement = null;
+  if (input.replacement) {
+    replacement = await createReplacementScheduledTask(store, run, interrupted, input.replacement, reason);
+    await store.updateScheduledTask(interrupted.id, {
+      supersededByTaskId: replacement.id
+    });
+  }
+  await store.createMessage({
+    roomId: run.roomId,
+    senderType: 'system',
+    senderName: 'AgentIM',
+    content: [
+      `Task interrupted: ${interrupted.title}`,
+      `Reason: ${reason}`,
+      replacement ? `Replacement task: ${replacement.title}` : ''
+    ].filter(Boolean).join('\n'),
+    status: 'done',
+    pending: false
+  });
+  if (replacement) await dispatchDueScheduledTasks(store);
+  return { task: interrupted, replacement };
+}
+
+async function createRevisionScheduledTask(store, run, task, input, notes) {
+  const revision = normalizeJsonObject(input.revision, {});
+  const agent = resolveTaskPlanAgent({
+    agent: revision.agent ?? input.agent,
+    role: revision.role ?? input.role
+  }, await store.listRoomAgents(run.roomId), await store.getAgent(task.agentId));
+  if (!agent) throw new Error('revision_agent_not_found');
+  return store.createScheduledTask({
+    roomId: run.roomId,
+    agentId: agent.id,
+    title: String(revision.title ?? `Revise: ${task.title}`).trim(),
+    instructions: [
+      `Revise prior task: ${task.title}`,
+      notes ? `Requested changes: ${notes}` : '',
+      String(revision.instructions ?? input.instructions ?? task.instructions ?? '').trim()
+    ].filter(Boolean).join('\n\n'),
+    scheduleAt: normalizeScheduleAtInput(revision.scheduleAt) ?? new Date().toISOString(),
+    status: 'scheduled',
+    revisionOfTaskId: task.id,
+    dependsOnTaskIds: [],
+    createdBy: 'agent-review'
+  });
+}
+
+async function createReplacementScheduledTask(store, run, task, replacementInput, reason) {
+  const replacement = normalizeJsonObject(replacementInput, {});
+  const agent = resolveTaskPlanAgent({
+    agent: replacement.agent,
+    role: replacement.role
+  }, await store.listRoomAgents(run.roomId), await store.getAgent(task.agentId));
+  if (!agent) throw new Error('replacement_agent_not_found');
+  return store.createScheduledTask({
+    roomId: run.roomId,
+    agentId: agent.id,
+    title: String(replacement.title ?? `Replacement: ${task.title}`).trim(),
+    instructions: [
+      `Replacement for interrupted task: ${task.title}`,
+      `Reason: ${reason}`,
+      String(replacement.instructions ?? task.instructions ?? '').trim()
+    ].filter(Boolean).join('\n\n'),
+    scheduleAt: normalizeScheduleAtInput(replacement.scheduleAt) ?? new Date().toISOString(),
+    status: 'scheduled',
+    revisionOfTaskId: task.id,
+    createdBy: 'agent-interrupt'
+  });
+}
+
+async function resolveScheduledTask(store, ref) {
+  const requested = String(ref ?? '').trim();
+  if (!requested) return null;
+  const direct = await store.getScheduledTask(requested);
+  if (direct) return direct;
+  const tasks = await store.listScheduledTasks(null, { limit: 300 });
+  return tasks.find((task) => roomNameMatches(task.title, requested)) ?? null;
+}
+
+function normalizeReviewDecision(value) {
+  const decision = String(value ?? '').trim().toLowerCase();
+  if (['approved', 'approve', 'accepted', 'accept'].includes(decision)) return 'approved';
+  if (['changes_requested', 'request_changes', 'changes', 'revise', 'revision'].includes(decision)) return 'changes_requested';
+  return '';
+}
+
 function filterAvailableSkillIds(skillIds, skills) {
   const enabled = new Set((skills ?? [])
     .filter((skill) => skill?.enabled !== false)
@@ -3717,6 +4157,8 @@ const PLATFORM_ACTION_SKILLS = {
   'project.create': 'project.create',
   'project.read': 'project.read',
   'project.delete': 'project.delete',
+  'task.review': 'task.review',
+  'task.interrupt': 'task.interrupt',
   'task.run': 'task.run',
   'task.cancel': 'task.cancel',
   'artifact.read': 'artifact.read',
@@ -3945,6 +4387,14 @@ async function executePlatformAction(store, run, request, workspaceScope, skills
     }
     const deleted = await store.deleteProject(project.id);
     return platformResult(`deleted project ${project.name}`, { project: deleted, deletedFiles: Boolean(input.deleteFiles) });
+  }
+  if (request.action === 'task.review') {
+    const result = await reviewScheduledTask(store, run, input);
+    return platformResult(`reviewed task ${result.task.title}: ${result.decision}`, result);
+  }
+  if (request.action === 'task.interrupt') {
+    const result = await interruptScheduledTask(store, run, input);
+    return platformResult(`interrupted task ${result.task.title}`, result);
   }
   if (request.action === 'task.run') {
     const task = await store.getScheduledTask(String(input.taskId ?? input.task ?? '').trim());
@@ -4610,6 +5060,43 @@ function parseRoomAssignBlocks(content) {
   return blocks.slice(0, 16);
 }
 
+function parseTaskPlanBlocks(content) {
+  const blocks = [];
+  const pattern = /```agentim-task-plan\s*\n([\s\S]*?)```/g;
+  for (const match of String(content ?? '').matchAll(pattern)) {
+    const payload = parseJsonBlock(match[1]);
+    if (!payload) continue;
+    const rawItems = Array.isArray(payload.items) ? payload.items : [];
+    const items = rawItems
+      .map((item, index) => normalizeTaskPlanItem(item, index))
+      .filter((item) => item.title && item.instructions);
+    if (items.length === 0) continue;
+    blocks.push({
+      title: String(payload.title ?? 'Agent task plan').trim() || 'Agent task plan',
+      summary: String(payload.summary ?? '').trim(),
+      items: items.slice(0, 20)
+    });
+  }
+  return blocks.slice(0, 4);
+}
+
+function normalizeTaskPlanItem(item, index) {
+  const input = normalizeJsonObject(item, {});
+  return {
+    id: String(input.id ?? `task-${index + 1}`).trim() || `task-${index + 1}`,
+    title: String(input.title ?? `Task ${index + 1}`).trim() || `Task ${index + 1}`,
+    instructions: String(input.instructions ?? input.prompt ?? '').trim(),
+    agent: String(input.agent ?? input.agentId ?? input.agentName ?? '').trim(),
+    role: String(input.role ?? input.roleId ?? '').trim(),
+    scheduleAt: normalizeScheduleAtInput(input.scheduleAt) ?? new Date().toISOString(),
+    repeatInterval: normalizeRepeatIntervalInput(input.repeatInterval),
+    dependsOn: normalizeScheduledTaskDependencyInput(input.dependsOn ?? input.dependsOnTaskIds ?? input.dependsOnTaskId),
+    acceptanceCriteria: normalizeStringList(input.acceptanceCriteria ?? input.acceptance ?? []).slice(0, 12),
+    reviewWith: String(input.reviewWith ?? input.reviewer ?? '').trim(),
+    artifact: String(input.artifact ?? input.expectedArtifact ?? '').trim()
+  };
+}
+
 function parseJsonBlock(value) {
   try {
     const parsed = JSON.parse(String(value ?? '').trim());
@@ -5174,7 +5661,7 @@ function buildAgentSystemPrompt(agent, roomAgents, workspaceContext = '', role, 
     ? `\n\nYou can attach existing Agents to an existing room by emitting this controlled JSON block:\n\`\`\`agentim-room-assign\n{"room":"Room name","agents":["Agent Name"],"triggerMode":"manual"}\n\`\`\`\nUse existing room and Agent names or ids only. Do not claim Agents were assigned unless you emitted the block.`
     : '\n\nYou do not have room.assign enabled. Do not claim to assign Agents to rooms.';
   const taskPlanning = skillSet.has('task.schedule')
-    ? `\n\nWhen future work should be scheduled, propose it as a controlled task plan block instead of only describing it:\n\`\`\`agentim-task-plan\n{\n  "title": "Plan title",\n  "items": [\n    {\n      "id": "short-step-id",\n      "title": "Task title",\n      "instructions": "Clear task instructions",\n      "agent": "Agent name or omit for yourself",\n      "scheduleAt": "ISO datetime or omit for soon",\n      "repeatInterval": "daily, weekly, or omit",\n      "dependsOn": ["previous-step-id"]\n    }\n  ]\n}\n\`\`\`\nUse dependsOn when a later Agent task must wait for earlier scheduled work to complete. Use this when the user asks you to make a plan, schedule follow-up work, or delegate future work.`
+    ? `\n\nYou can schedule autonomous work for room Agents by emitting a controlled task plan block. The platform will create scheduled tasks, start tasks with no pending dependencies, and automatically start dependent tasks after earlier tasks complete:\n\`\`\`agentim-task-plan\n{\n  "title": "Plan title",\n  "summary": "Why these tasks matter",\n  "items": [\n    {\n      "id": "short-step-id",\n      "title": "Task title",\n      "instructions": "Clear task instructions",\n      "agent": "Agent name or omit to assign yourself",\n      "role": "designer or full-stack-developer when choosing by role",\n      "scheduleAt": "ISO datetime or omit for now",\n      "repeatInterval": "daily, weekly, or omit",\n      "dependsOn": ["previous-step-id"],\n      "acceptanceCriteria": ["What done means"],\n      "artifact": "Expected artifact or preview path if useful",\n      "reviewWith": "Agent or role that should review the result"\n    }\n  ]\n}\n\`\`\`\nUse this for PM-style delegation, design-review-development flows, or any work that should continue without requiring @mentions. Prefer role when the exact Agent name is not important. Public preview artifacts should be submitted as soon as they exist; PM approval gates workflow progress, not artifact visibility.`
     : '\n\nYou do not have task.schedule enabled. Do not emit task scheduling protocol blocks.';
   const approvalGuidance = '\n\nApproval policy: execute ordinary low and medium risk work by default. Do not ask for approval before normal reading, writing project files, creating artifacts, routine Agent collaboration, or ordinary scheduled work. Ask only for genuinely high-risk, destructive, costly, external, ambiguous, or user-owned decisions.';
   const userApproval = skillSet.has('user.request_approval')

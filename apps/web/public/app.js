@@ -1134,12 +1134,31 @@ function renderRoomTemplates() {
           <p class="circle-card-description">${escapeHtml(template.description)}</p>
           <div class="circle-card-meta">
             <span>${agents.length} Agents</span>
+            ${template.collaborationMode ? `<span>${escapeHtml(titleCase(template.collaborationMode))}</span>` : ''}
             <span>${escapeHtml(agents.slice(0, 3).map((agent) => agent.name).join(' / '))}${agents.length > 3 ? ' +' : ''}</span>
           </div>
           <details class="template-preview">
             <summary>Preview</summary>
             <div class="template-preview-body">
               <p>${escapeHtml(template.roomDescription ?? template.description ?? '')}</p>
+              ${template.outcome ? `<p><strong>Outcome:</strong> ${escapeHtml(template.outcome)}</p>` : ''}
+              ${Array.isArray(template.slots) && template.slots.length > 0 ? `
+                <div class="circle-slot-list">
+                  ${template.slots.map((slot) => `
+                    <div class="circle-slot-item ${slot.required ? 'required' : ''}">
+                      <strong>${escapeHtml(slot.label ?? slot.id)}</strong>
+                      <span>${escapeHtml(slot.required ? 'Required' : 'Optional')} · ${escapeHtml(slot.description ?? slot.roleId ?? '')}</span>
+                    </div>
+                  `).join('')}
+                </div>
+              ` : ''}
+              ${template.workflow?.steps?.length ? `
+                <div class="circle-workflow-list">
+                  ${template.workflow.steps.map((step, index) => `
+                    <span>${index + 1}. ${escapeHtml(step.title ?? step.id)}</span>
+                  `).join('')}
+                </div>
+              ` : ''}
               <div class="template-chip-list">
                 ${agents.map((agent) => `<span>${escapeHtml(agent.name)}</span>`).join('')}
               </div>
@@ -1166,11 +1185,13 @@ function renderRoomTemplates() {
               </label>
               <div class="circle-agent-picker">
                 <strong>Agents</strong>
-                ${agents.map((agent) => `
+                ${agents.map((agent) => {
+                  const slot = (template.slots ?? []).find((item) => item.agentTemplateId === agent.id);
+                  return `
                   <div class="circle-agent-row" data-circle-agent-row="${escapeHtml(agent.id)}">
                     <label class="circle-agent-enable">
-                      <input type="checkbox" name="agentTemplateIds" value="${escapeHtml(agent.id)}" checked />
-                      <span>${escapeHtml(agent.name)}</span>
+                      <input type="checkbox" name="agentTemplateIds" value="${escapeHtml(agent.id)}" ${slot?.required ? 'checked disabled' : 'checked'} />
+                      <span>${escapeHtml(agent.name)}${slot?.required ? ' · required' : ''}</span>
                     </label>
                     <select name="agentProvider:${escapeHtml(agent.id)}" data-circle-agent-provider>
                       ${providerOptions || '<option value="">No provider</option>'}
@@ -1179,7 +1200,8 @@ function renderRoomTemplates() {
                       ${modelOptions || '<option value="">No models available</option>'}
                     </select>
                   </div>
-                `).join('')}
+                `;
+                }).join('')}
               </div>
             </div>
           </details>
@@ -1262,7 +1284,11 @@ async function createRoomFromTemplate(templateId, form) {
   const selectedAgentIds = data
     ? data.getAll('agentTemplateIds').map((id) => String(id))
     : (template.agentTemplateIds ?? []);
-  if (selectedAgentIds.length === 0) {
+  const requiredAgentIds = (template.slots ?? [])
+    .filter((slot) => slot.required && slot.agentTemplateId)
+    .map((slot) => String(slot.agentTemplateId));
+  const agentIds = [...new Set([...selectedAgentIds, ...requiredAgentIds])];
+  if (agentIds.length === 0) {
     alert('Select at least one Agent for this Circle.');
     return;
   }
@@ -1279,7 +1305,7 @@ async function createRoomFromTemplate(templateId, form) {
       name: String(data?.get('name') ?? template.roomName ?? template.name).trim(),
       defaultProviderId: provider.id,
       defaultModel: model,
-      agents: selectedAgentIds.map((templateId) => ({
+      agents: agentIds.map((templateId) => ({
         templateId,
         providerId: String(data?.get(`agentProvider:${templateId}`) ?? provider.id),
         model: String(data?.get(`agentModel:${templateId}`) ?? model)
@@ -1300,7 +1326,10 @@ async function createRoomFromTemplate(templateId, form) {
   await refreshWorkspace();
   await loadLatestMessages({ markMentionsSeen: true });
   renderAll();
-  alert(`${template.name} room created with ${(result.agents ?? []).length} Agents.`);
+  const autoAssigned = (result.circle?.slotAssignments ?? [])
+    .filter((assignment) => requiredAgentIds.includes(String(assignment.templateId)) && !selectedAgentIds.includes(String(assignment.templateId)))
+    .map((assignment) => assignment.agentName);
+  alert(`${template.name} room created with ${(result.agents ?? []).length} Agents.${autoAssigned.length > 0 ? `\nAuto-added required Agents: ${autoAssigned.join(', ')}` : ''}`);
 }
 
 function renderCircleModelOptions(container, providerId, selector = '[data-circle-model]') {
@@ -2125,11 +2154,18 @@ function renderTasks() {
               <span>${escapeHtml(agent?.name ?? 'Unknown Agent')} · ${escapeHtml(formatTaskTime(task))}</span>
               ${scheduledTaskDependencyLabel(task) ? `<span>${escapeHtml(scheduledTaskDependencyLabel(task))}</span>` : ''}
               ${task.repeatInterval ? `<span>Repeat · ${escapeHtml(task.repeatInterval)}${task.parentTaskId ? ' · recurring instance' : ''}</span>` : ''}
+              ${task.reviewDecision ? `<span>Review · ${escapeHtml(task.reviewDecision)}${task.reviewNotes ? ` · ${escapeHtml(task.reviewNotes)}` : ''}</span>` : ''}
+              ${task.reviewOfTaskId ? `<span>Review of · ${escapeHtml(taskTitleById(task.reviewOfTaskId))}</span>` : ''}
+              ${task.revisionOfTaskId ? `<span>Revision of · ${escapeHtml(taskTitleById(task.revisionOfTaskId))}</span>` : ''}
+              ${task.supersededByTaskId ? `<span>Superseded by · ${escapeHtml(taskTitleById(task.supersededByTaskId))}</span>` : ''}
               <span>${escapeHtml(task.instructions)}</span>
               ${task.error ? `<span>${escapeHtml(task.error)}</span>` : ''}
             </div>
             <div class="entity-actions">
               ${canAct ? `<button type="button" data-run-task="${escapeHtml(task.id)}">Run Now</button>` : ''}
+              ${['done', 'changes_requested'].includes(status) ? `<button type="button" data-approve-task="${escapeHtml(task.id)}">Approve</button>` : ''}
+              ${['done', 'approved'].includes(status) ? `<button type="button" data-request-task-changes="${escapeHtml(task.id)}">Request Changes</button>` : ''}
+              ${status === 'running' ? `<button type="button" class="danger-button" data-interrupt-task="${escapeHtml(task.id)}">Interrupt</button>` : ''}
               ${canAct ? `<button type="button" class="danger-button" data-cancel-task="${escapeHtml(task.id)}">Cancel</button>` : ''}
               ${status !== 'running' && (task.repeatInterval || task.parentTaskId) ? `<button type="button" class="danger-button" data-delete-task-series="${escapeHtml(task.id)}">Delete Series</button>` : ''}
               ${status === 'running' ? '' : `<button type="button" class="danger-button" data-delete-task="${escapeHtml(task.id)}">Delete</button>`}
@@ -2152,6 +2188,30 @@ function renderTasks() {
       const task = state.tasks.find((entry) => entry.id === taskId);
       if (!task || !confirm(`Cancel task "${task.title}"?`)) return;
       await updateTaskAction(taskId, 'cancel');
+    });
+  }
+
+  for (const item of els.taskList.querySelectorAll('[data-approve-task]')) {
+    item.addEventListener('click', async () => {
+      await reviewTask(item.getAttribute('data-approve-task'), 'approved');
+    });
+  }
+
+  for (const item of els.taskList.querySelectorAll('[data-request-task-changes]')) {
+    item.addEventListener('click', async () => {
+      const taskId = item.getAttribute('data-request-task-changes');
+      const notes = prompt('What changes are needed?');
+      if (notes === null) return;
+      await reviewTask(taskId, 'changes_requested', notes);
+    });
+  }
+
+  for (const item of els.taskList.querySelectorAll('[data-interrupt-task]')) {
+    item.addEventListener('click', async () => {
+      const taskId = item.getAttribute('data-interrupt-task');
+      const reason = prompt('Why interrupt this task?');
+      if (reason === null) return;
+      await interruptTask(taskId, reason);
     });
   }
 
@@ -2586,6 +2646,41 @@ async function updateTaskAction(taskId, action) {
     ensureMessagePolling();
   } catch (error) {
     alert(`Task action failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function reviewTask(taskId, decision, notes = '') {
+  if (!taskId || !state.activeRoomId) return;
+  try {
+    const result = await api(`/api/tasks/${encodeURIComponent(taskId)}/review`, {
+      method: 'POST',
+      body: { decision, notes }
+    });
+    if (result.task) replaceByIdOrPush(state.tasks, result.task);
+    if (result.revision) replaceByIdOrPush(state.tasks, result.revision);
+    await refreshTasks();
+    renderAll();
+    ensureMessagePolling();
+  } catch (error) {
+    alert(`Task review failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function interruptTask(taskId, reason = '') {
+  if (!taskId || !state.activeRoomId) return;
+  try {
+    const result = await api(`/api/tasks/${encodeURIComponent(taskId)}/interrupt`, {
+      method: 'POST',
+      body: { reason }
+    });
+    if (result.task) replaceByIdOrPush(state.tasks, result.task);
+    if (result.replacement) replaceByIdOrPush(state.tasks, result.replacement);
+    state.agentRuns = await api(`/api/rooms/${state.activeRoomId}/agent-runs`);
+    await refreshTasks();
+    renderAll();
+    ensureMessagePolling();
+  } catch (error) {
+    alert(`Task interrupt failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -4114,6 +4209,11 @@ function scheduledTaskDependencyLabel(task) {
   return `after ${labels.join(', ')}`;
 }
 
+function taskTitleById(taskId) {
+  const task = state.tasks.find((item) => item.id === taskId);
+  return task?.title ?? taskId;
+}
+
 function buildAgentWorkGroups() {
   const activeAgents = state.agents.filter((agent) => isAgentInActiveRoom(agent.id));
   const agentMap = new Map(activeAgents.map((agent) => [agent.id, {
@@ -4180,7 +4280,7 @@ function isVisibleAgentRun(run) {
 }
 
 function isVisibleScheduledWorkTask(task) {
-  return ['scheduled', 'running', 'failed', 'cancelled'].includes(task.status);
+  return ['scheduled', 'running', 'failed', 'cancelled', 'approved', 'changes_requested', 'interrupted', 'superseded'].includes(task.status);
 }
 
 function agentRunWorkItem(run) {
@@ -4307,6 +4407,10 @@ function inspectorTaskRank(status) {
     blocked: 3,
     failed: 4,
     cancelled: 5,
+    changes_requested: 5,
+    interrupted: 5,
+    superseded: 5,
+    approved: 6,
     done: 6
   }[status] ?? 7;
 }

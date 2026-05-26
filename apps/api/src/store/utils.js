@@ -406,6 +406,42 @@ export const DEFAULT_SKILLS = [
     description: 'Propose schedulable task plans for Agents.'
   },
   {
+    id: 'task.review',
+    name: 'Task Review',
+    version: '1.0.0',
+    category: 'collaboration',
+    common: true,
+    installed: true,
+    enabled: true,
+    source: 'system',
+    runtime: { kind: 'server', adapter: 'agentim.task' },
+    inputSchema: { type: 'object' },
+    outputSchema: { type: 'object' },
+    policy: { workspace: 'none', network: false, destructive: false },
+    ui: { card: 'task-plan' },
+    riskLevel: 'medium',
+    requiresApproval: false,
+    description: 'Approve task results or request changes and create revision work.'
+  },
+  {
+    id: 'task.interrupt',
+    name: 'Task Interrupt',
+    version: '1.0.0',
+    category: 'collaboration',
+    common: true,
+    installed: true,
+    enabled: true,
+    source: 'system',
+    runtime: { kind: 'server', adapter: 'agentim.task' },
+    inputSchema: { type: 'object' },
+    outputSchema: { type: 'object' },
+    policy: { workspace: 'none', network: false, destructive: false },
+    ui: { card: 'task-plan' },
+    riskLevel: 'medium',
+    requiresApproval: false,
+    description: 'Interrupt or supersede active tasks and optionally create replacement work.'
+  },
+  {
     id: 'task.run',
     name: 'Task Run',
     version: '1.0.0',
@@ -789,6 +825,9 @@ export const STANDARD_ROLE_SKILL_IDS = [
   'room.assign',
   'room.update',
   'skill.read',
+  'task.schedule',
+  'task.review',
+  'task.interrupt',
   'task.run',
   'task.cancel',
   'project.read',
@@ -811,7 +850,7 @@ export const DEFAULT_ROLES = [
     name: 'Product Manager',
     description: 'Turns user intent into plans, acceptance criteria, and coordinated room work.',
     systemPrompt: 'You are a product manager Agent. Clarify goals, break work into practical plans, define acceptance criteria, and coordinate other Agents when useful.',
-    skillIds: ['provider.chat', 'workspace.read', 'web.read', 'artifact.card', 'agent.message', 'role.read', 'role.create', 'role.update', 'agent.read', 'agent.create', 'agent.update', 'agent.test', 'room.read', 'room.create', 'room.assign', 'room.update', 'skill.read', 'task.run', 'task.cancel', 'project.read', 'project.create', 'artifact.read', 'activity.read', 'user.notify'],
+    skillIds: ['provider.chat', 'workspace.read', 'web.read', 'artifact.card', 'agent.message', 'role.read', 'role.create', 'role.update', 'agent.read', 'agent.create', 'agent.update', 'agent.test', 'room.read', 'room.create', 'room.assign', 'room.update', 'skill.read', 'task.schedule', 'task.review', 'task.interrupt', 'task.run', 'task.cancel', 'project.read', 'project.create', 'artifact.read', 'activity.read', 'user.notify'],
     system: true
   },
   {
@@ -1136,6 +1175,11 @@ function normalizeScheduledTask(task) {
     scheduleAt: String(task.scheduleAt ?? task.createdAt ?? nowIso()),
     status: normalizeTaskStatus(task.status),
     error: task.error ? String(task.error) : undefined,
+    reviewDecision: task.reviewDecision ? String(task.reviewDecision) : undefined,
+    reviewNotes: task.reviewNotes ? String(task.reviewNotes) : undefined,
+    reviewOfTaskId: task.reviewOfTaskId ? String(task.reviewOfTaskId) : undefined,
+    revisionOfTaskId: task.revisionOfTaskId ? String(task.revisionOfTaskId) : undefined,
+    supersededByTaskId: task.supersededByTaskId ? String(task.supersededByTaskId) : undefined,
     repeatInterval: normalizeTaskRepeatInterval(task.repeatInterval),
     parentTaskId: task.parentTaskId ? String(task.parentTaskId) : undefined,
     dependsOnTaskId: dependsOnTaskIds[0],
@@ -1151,7 +1195,7 @@ function normalizeScheduledTaskDependencies(task) {
 }
 
 function normalizeTaskStatus(status) {
-  return ['scheduled', 'running', 'done', 'failed', 'cancelled'].includes(status) ? status : 'scheduled';
+  return ['scheduled', 'running', 'done', 'failed', 'cancelled', 'interrupted', 'superseded', 'approved', 'changes_requested'].includes(status) ? status : 'scheduled';
 }
 
 function normalizeTaskRepeatInterval(value) {

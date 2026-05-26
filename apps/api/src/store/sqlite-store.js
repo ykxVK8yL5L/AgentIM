@@ -645,6 +645,11 @@ function ensureSchema(sqlitePath) {
       run_id text,
       message_id text,
       error text,
+      review_decision text,
+      review_notes text,
+      review_of_task_id text,
+      revision_of_task_id text,
+      superseded_by_task_id text,
       created_by text not null,
       repeat_interval text,
       parent_task_id text,
@@ -781,6 +786,11 @@ function ensureSchema(sqlitePath) {
   ensureColumn(sqlitePath, 'scheduled_tasks', 'parent_task_id', 'text');
   ensureColumn(sqlitePath, 'scheduled_tasks', 'depends_on_task_id', 'text');
   ensureColumn(sqlitePath, 'scheduled_tasks', 'depends_on_task_ids', 'text');
+  ensureColumn(sqlitePath, 'scheduled_tasks', 'review_decision', 'text');
+  ensureColumn(sqlitePath, 'scheduled_tasks', 'review_notes', 'text');
+  ensureColumn(sqlitePath, 'scheduled_tasks', 'review_of_task_id', 'text');
+  ensureColumn(sqlitePath, 'scheduled_tasks', 'revision_of_task_id', 'text');
+  ensureColumn(sqlitePath, 'scheduled_tasks', 'superseded_by_task_id', 'text');
   ensureColumn(sqlitePath, 'project_tasks', 'depends_on_task_ids', 'text');
 }
 
@@ -989,7 +999,8 @@ function insertScheduledTask(sqlitePath, task) {
   execSql(sqlitePath, `
     insert into scheduled_tasks (
       id, room_id, agent_id, title, instructions, schedule_at, status,
-      run_id, message_id, error, created_by, repeat_interval, parent_task_id, depends_on_task_id, depends_on_task_ids, created_at, updated_at,
+      run_id, message_id, error, review_decision, review_notes, review_of_task_id, revision_of_task_id, superseded_by_task_id,
+      created_by, repeat_interval, parent_task_id, depends_on_task_id, depends_on_task_ids, created_at, updated_at,
       started_at, completed_at, cancelled_at
     ) values (
       ${sqlString(task.id)},
@@ -1002,6 +1013,11 @@ function insertScheduledTask(sqlitePath, task) {
       ${sqlValue(task.runId)},
       ${sqlValue(task.messageId)},
       ${sqlValue(task.error)},
+      ${sqlValue(task.reviewDecision)},
+      ${sqlValue(task.reviewNotes)},
+      ${sqlValue(task.reviewOfTaskId)},
+      ${sqlValue(task.revisionOfTaskId)},
+      ${sqlValue(task.supersededByTaskId)},
       ${sqlString(task.createdBy ?? 'user')},
       ${sqlValue(task.repeatInterval)},
       ${sqlValue(task.parentTaskId)},
@@ -1023,6 +1039,11 @@ function insertScheduledTask(sqlitePath, task) {
       run_id = excluded.run_id,
       message_id = excluded.message_id,
       error = excluded.error,
+      review_decision = excluded.review_decision,
+      review_notes = excluded.review_notes,
+      review_of_task_id = excluded.review_of_task_id,
+      revision_of_task_id = excluded.revision_of_task_id,
+      superseded_by_task_id = excluded.superseded_by_task_id,
       created_by = excluded.created_by,
       repeat_interval = excluded.repeat_interval,
       parent_task_id = excluded.parent_task_id,
@@ -1047,6 +1068,11 @@ function updateScheduledTaskRow(sqlitePath, id, input, updatedAt) {
   addInputField(fields, input, 'runId', 'run_id');
   addInputField(fields, input, 'messageId', 'message_id');
   addInputField(fields, input, 'error', 'error');
+  addInputField(fields, input, 'reviewDecision', 'review_decision');
+  addInputField(fields, input, 'reviewNotes', 'review_notes');
+  addInputField(fields, input, 'reviewOfTaskId', 'review_of_task_id');
+  addInputField(fields, input, 'revisionOfTaskId', 'revision_of_task_id');
+  addInputField(fields, input, 'supersededByTaskId', 'superseded_by_task_id');
   addInputField(fields, input, 'createdBy', 'created_by');
   addInputField(fields, input, 'repeatInterval', 'repeat_interval');
   addInputField(fields, input, 'parentTaskId', 'parent_task_id');
@@ -1425,6 +1451,11 @@ function rowToScheduledTask(row) {
     runId: row.run_id ?? undefined,
     messageId: row.message_id ?? undefined,
     error: row.error ?? undefined,
+    reviewDecision: row.review_decision ?? undefined,
+    reviewNotes: row.review_notes ?? undefined,
+    reviewOfTaskId: row.review_of_task_id ?? undefined,
+    revisionOfTaskId: row.revision_of_task_id ?? undefined,
+    supersededByTaskId: row.superseded_by_task_id ?? undefined,
     createdBy: row.created_by,
     repeatInterval: row.repeat_interval ?? undefined,
     parentTaskId: row.parent_task_id ?? undefined,
