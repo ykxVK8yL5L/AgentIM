@@ -1,0 +1,172 @@
+{
+  "id": "openweathermap",
+  "name": "OpenWeatherMap",
+  "version": "0.1.0",
+  "category": "integration",
+  "common": false,
+  "installed": true,
+  "enabled": true,
+  "source": "system-file",
+  "runtime": {
+    "kind": "server",
+    "adapter": "agentim.skill-action"
+  },
+  "inputSchema": {
+    "type": "object"
+  },
+  "outputSchema": {
+    "type": "object"
+  },
+  "permissions": {
+    "network": {
+      "hosts": [
+        "api.openweathermap.org"
+      ],
+      "allowHttp": false,
+      "allowLocalhost": false,
+      "allowPrivateNetwork": false
+    },
+    "secrets": [],
+    "approval": "auto"
+  },
+  "credentialTypes": {
+    "openWeatherMapApi": {
+      "name": "OpenWeatherMap API",
+      "fields": [
+        {
+          "name": "accessToken",
+          "label": "Access Token",
+          "type": "secret",
+          "required": true
+        }
+      ]
+    }
+  },
+  "credentials": [
+    {
+      "type": "openWeatherMapApi",
+      "multiple": true
+    }
+  ],
+  "actions": [
+    {
+      "id": "current",
+      "name": "Current Weather",
+      "type": "http",
+      "credentialType": "openWeatherMapApi",
+      "method": "GET",
+      "url": "https://api.openweathermap.org/data/2.5/weather",
+      "query": {
+        "appid": "${credential.accessToken}",
+        "units": "${input.units}",
+        "q": "${input.cityName}",
+        "id": "${input.cityId}",
+        "lat": "${input.latitude}",
+        "lon": "${input.longitude}",
+        "zip": "${input.zipCode}",
+        "lang": "${input.language}"
+      },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cityName": {
+            "type": "string"
+          },
+          "cityId": {
+            "type": "number"
+          },
+          "latitude": {
+            "type": "number"
+          },
+          "longitude": {
+            "type": "number"
+          },
+          "zipCode": {
+            "type": "string"
+          },
+          "units": {
+            "type": "string",
+            "enum": [
+              "metric",
+              "imperial",
+              "standard"
+            ],
+            "default": "metric"
+          },
+          "language": {
+            "type": "string"
+          }
+        }
+      },
+      "response": {
+        "mode": "json",
+        "maxBytes": 30000
+      }
+    },
+    {
+      "id": "forecast",
+      "name": "5 Day Forecast",
+      "type": "http",
+      "credentialType": "openWeatherMapApi",
+      "method": "GET",
+      "url": "https://api.openweathermap.org/data/2.5/forecast",
+      "query": {
+        "appid": "${credential.accessToken}",
+        "units": "${input.units}",
+        "q": "${input.cityName}",
+        "id": "${input.cityId}",
+        "lat": "${input.latitude}",
+        "lon": "${input.longitude}",
+        "zip": "${input.zipCode}",
+        "lang": "${input.language}"
+      },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cityName": {
+            "type": "string"
+          },
+          "cityId": {
+            "type": "number"
+          },
+          "latitude": {
+            "type": "number"
+          },
+          "longitude": {
+            "type": "number"
+          },
+          "zipCode": {
+            "type": "string"
+          },
+          "units": {
+            "type": "string",
+            "enum": [
+              "metric",
+              "imperial",
+              "standard"
+            ],
+            "default": "metric"
+          },
+          "language": {
+            "type": "string"
+          }
+        }
+      },
+      "response": {
+        "mode": "json",
+        "maxBytes": 60000
+      }
+    }
+  ],
+  "policy": {
+    "workspace": "none",
+    "network": true,
+    "destructive": false
+  },
+  "ui": {
+    "card": "skill-result"
+  },
+  "riskLevel": "low",
+  "requiresApproval": false,
+  "description": "Look up current weather and 5 day forecasts through OpenWeatherMap. Requires an OpenWeatherMap API credential. Provide at least one location field: cityName, cityId, latitude and longitude, or zipCode."
+}

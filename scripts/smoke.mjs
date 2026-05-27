@@ -107,6 +107,101 @@ async function main() {
     assert(!files.files.some((file) => file.name === 'hello.txt'), 'approved delete should remove file');
   });
 
+  await step('skill approval trust can be granted and revoked', async () => {
+    const provider = await ensureProvider();
+    const skill = await api('/api/skills/install', {
+      method: 'POST',
+      body: {
+        id: 'smoke.http',
+        name: 'Smoke HTTP',
+        description: 'Smoke test HTTP skill',
+        version: '0.1.0',
+        enabled: true,
+        runtime: { kind: 'server', adapter: 'agentim.skill-action' },
+        permissions: {
+          network: {
+            hosts: ['127.0.0.1'],
+            allowHttp: true,
+            allowLocalhost: true,
+            allowPrivateNetwork: true
+          },
+          approval: 'strict'
+        },
+        actions: [
+          {
+            id: 'ping',
+            name: 'Ping',
+            type: 'http',
+            method: 'GET',
+            url: `${baseUrl}/api/health`,
+            permissions: {
+              network: {
+                hosts: ['127.0.0.1'],
+                allowHttp: true,
+                allowLocalhost: true,
+                allowPrivateNetwork: true
+              }
+            }
+          }
+        ],
+        policy: { workspace: 'none', network: true, destructive: false, externalEffect: false },
+        riskLevel: 'high'
+      }
+    });
+    const role = await api('/api/roles', {
+      method: 'POST',
+      body: {
+        name: `Smoke Skill ${runId}`,
+        description: 'Role for skill approval smoke',
+        systemPrompt: 'You are a smoke test role.',
+        skillIds: ['provider.chat', skill.id]
+      }
+    });
+    const agent = await api('/api/agents', {
+      method: 'POST',
+      body: {
+        name: `SmokeSkill${runId.replace(/[^a-zA-Z0-9]/g, '')}`,
+        roleId: role.id,
+        providerId: provider.id,
+        model: provider.defaultModel,
+        roomId: room.id
+      }
+    });
+    await setApprovalMode('auto');
+    await api(`/api/rooms/${room.id}/dispatch`, {
+      method: 'POST',
+      body: {
+        content: `@${agent.name} emit a smoke skill action block`,
+        senderName: 'Smoke'
+      }
+    });
+    const run = await api(`/api/rooms/${room.id}/agent-runs`, {
+      method: 'POST',
+      body: {
+        agentId: agent.id,
+        maxTurns: 1
+      }
+    });
+    await waitForRunStatus(room.id, run.run.id, ['done']);
+    const approvals = await api(`/api/rooms/${room.id}/skill-approvals?limit=20`);
+    const approval = approvals.find((item) => item.skillId === skill.id && item.status === 'pending');
+    assert(approval, 'skill action should create a pending approval');
+    const approved = await api(`/api/skill-approvals/${approval.id}/approve`, {
+      method: 'POST',
+      body: { trustScope: 'room' }
+    });
+    assert(approved.approval?.input?.trustScope === 'room', 'approval should store room trust scope');
+    assert(approved.invocation?.status === 'done', 'approved skill action should execute');
+    const revoked = await api(`/api/skill-approvals/${approval.id}/revoke-trust`, {
+      method: 'POST'
+    });
+    assert(!revoked.approval?.input?.trustScope, 'revoke should clear room trust scope');
+    assert(revoked.approval?.input?.trustRevokedAt, 'revoke should record revocation time');
+    await api(`/api/agents/${agent.id}`, { method: 'DELETE' });
+    await api(`/api/roles/${role.id}`, { method: 'DELETE' });
+    await api(`/api/skills/${skill.id}`, { method: 'DELETE' });
+  });
+
   await step('off mode deletes directly', async () => {
     await api(`/api/rooms/${room.id}/files/write`, {
       method: 'PUT',
@@ -120,6 +215,58 @@ async function main() {
       method: 'DELETE'
     });
     assert(deletion.ok && !deletion.approvalRequired, 'delete should execute directly in off mode');
+  });
+
+  await step('structured credentials can be created and edited', async () => {
+    const typeId = `smokeCredential${Date.now()}`;
+    const typeResult = await api('/api/settings/credential-types', {
+      method: 'POST',
+      body: {
+        id: typeId,
+        name: `Smoke Credential ${runId}`,
+        fields: [
+          { name: 'base_url', label: 'Base URL', type: 'url', required: true },
+          { name: 'api_key', label: 'API Key', type: 'secret', required: true },
+          { name: 'channel', label: 'Channel', type: 'string' }
+        ]
+      }
+    });
+    assert(typeResult.customCredentialTypes.some((type) => type.id === typeId), 'custom credential type should be saved');
+    const created = await api('/api/settings/credentials', {
+      method: 'POST',
+      body: {
+        type: typeId,
+        name: `Smoke Credential ${runId}`,
+        values: {
+          base_url: 'https://example.test',
+          api_key: 'first-secret',
+          channel: 'alpha'
+        }
+      }
+    });
+    const credential = created.credentials.find((item) => item.type === typeId);
+    assert(credential?.values?.api_key?.hasValue, 'secret credential field should be redacted but present');
+    const edited = await api('/api/settings/credentials', {
+      method: 'POST',
+      body: {
+        id: credential.id,
+        type: typeId,
+        name: `Smoke Credential Edited ${runId}`,
+        values: {
+          base_url: 'https://example.test/v2',
+          api_key: '',
+          channel: 'beta'
+        }
+      }
+    });
+    const updated = edited.credentials.find((item) => item.id === credential.id);
+    assert(updated?.name.includes('Edited'), 'credential name should update');
+    assert(updated?.values?.api_key?.hasValue, 'blank secret edit should keep stored secret');
+    const tested = await api(`/api/settings/credentials/${credential.id}/test`, { method: 'POST' });
+    assert(tested.ok, 'credential dry-run test should pass for valid structured fields');
+    assert(tested.checks.some((check) => check.status === 'passed'), 'credential test should return passed checks');
+    await api(`/api/settings/credentials/${credential.id}`, { method: 'DELETE' });
+    await api(`/api/settings/credential-types/${typeId}`, { method: 'DELETE' });
   });
 
   await step('export workspace zip', async () => {

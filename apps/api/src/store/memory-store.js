@@ -30,6 +30,11 @@ export class MemoryStore {
         ...this.state.settings.network,
         ...input.network
       },
+      apiRequest: {
+        ...this.state.settings.apiRequest,
+        ...input.apiRequest
+      },
+      secrets: input.secrets ?? this.state.settings.secrets,
       chat: {
         ...this.state.settings.chat,
         ...input.chat

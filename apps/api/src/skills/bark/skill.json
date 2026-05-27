@@ -1,0 +1,230 @@
+{
+  "id": "bark",
+  "name": "Bark",
+  "version": "0.1.0",
+  "category": "integration",
+  "common": false,
+  "installed": true,
+  "enabled": true,
+  "source": "system-file",
+  "runtime": {
+    "kind": "server",
+    "adapter": "agentim.skill-action"
+  },
+  "inputSchema": {
+    "type": "object"
+  },
+  "outputSchema": {
+    "type": "object"
+  },
+  "permissions": {
+    "network": {
+      "hosts": [
+        "api.day.app"
+      ],
+      "allowHttp": false,
+      "allowLocalhost": false,
+      "allowPrivateNetwork": false
+    },
+    "secrets": [],
+    "approval": "strict"
+  },
+  "credentialTypes": {
+    "barkDevice": {
+      "name": "Bark Device",
+      "fields": [
+        {
+          "name": "server_url",
+          "label": "Server URL",
+          "type": "url",
+          "required": true,
+          "default": "https://api.day.app"
+        },
+        {
+          "name": "device_key",
+          "label": "Device Key",
+          "type": "secret",
+          "required": true
+        },
+        {
+          "name": "subtitle",
+          "label": "Default Subtitle",
+          "type": "string"
+        },
+        {
+          "name": "level",
+          "label": "Default Level",
+          "type": "select",
+          "default": "active",
+          "options": [
+            "active",
+            "timeSensitive",
+            "passive",
+            "critical"
+          ]
+        },
+        {
+          "name": "badge",
+          "label": "Default Badge",
+          "type": "number"
+        },
+        {
+          "name": "sound",
+          "label": "Default Sound",
+          "type": "string"
+        },
+        {
+          "name": "icon",
+          "label": "Default Icon URL",
+          "type": "url"
+        },
+        {
+          "name": "group",
+          "label": "Default Group",
+          "type": "string"
+        },
+        {
+          "name": "url",
+          "label": "Default Open URL",
+          "type": "url"
+        },
+        {
+          "name": "copy",
+          "label": "Default Copy Text",
+          "type": "string"
+        },
+        {
+          "name": "automaticallyCopy",
+          "label": "Automatically Copy",
+          "type": "select",
+          "options": [
+            "",
+            "0",
+            "1"
+          ]
+        },
+        {
+          "name": "isArchive",
+          "label": "Save To Archive",
+          "type": "select",
+          "default": "1",
+          "options": [
+            "",
+            "0",
+            "1"
+          ]
+        }
+      ]
+    }
+  },
+  "credentials": [
+    {
+      "type": "barkDevice",
+      "multiple": true
+    }
+  ],
+  "actions": [
+    {
+      "id": "send",
+      "name": "Send Push Notification",
+      "type": "http",
+      "credentialType": "barkDevice",
+      "method": "POST",
+      "url": "${credential.server_url}/push",
+      "headers": {
+        "content-type": "application/json",
+        "accept": "application/json"
+      },
+      "body": {
+        "device_key": "${credential.device_key}",
+        "title": "${input.title}",
+        "body": "${input.body}",
+        "subtitle": "${input.subtitle}",
+        "level": "${input.level}",
+        "badge": "${input.badge}",
+        "sound": "${input.sound}",
+        "icon": "${input.icon}",
+        "group": "${input.group}",
+        "url": "${input.url}",
+        "copy": "${input.copy}",
+        "automaticallyCopy": "${input.automaticallyCopy}",
+        "isArchive": "${input.isArchive}"
+      },
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "title",
+          "body"
+        ],
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          },
+          "subtitle": {
+            "type": "string"
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "active",
+              "timeSensitive",
+              "passive",
+              "critical"
+            ]
+          },
+          "badge": {
+            "type": "number"
+          },
+          "sound": {
+            "type": "string"
+          },
+          "icon": {
+            "type": "string"
+          },
+          "group": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "copy": {
+            "type": "string"
+          },
+          "automaticallyCopy": {
+            "type": "number",
+            "enum": [
+              0,
+              1
+            ]
+          },
+          "isArchive": {
+            "type": "number",
+            "enum": [
+              0,
+              1
+            ]
+          }
+        }
+      },
+      "response": {
+        "mode": "json",
+        "maxBytes": 20000
+      }
+    }
+  ],
+  "policy": {
+    "workspace": "none",
+    "network": true,
+    "destructive": false,
+    "externalEffect": true
+  },
+  "ui": {
+    "card": "skill-result"
+  },
+  "riskLevel": "high",
+  "requiresApproval": true,
+  "description": "Send push notifications through Bark. Requires at least one Bark Device credential. Use only when the user explicitly asks to send a notification."
+}

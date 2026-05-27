@@ -1,0 +1,182 @@
+{
+  "id": "weather",
+  "name": "Weather",
+  "version": "0.1.0",
+  "category": "integration",
+  "common": true,
+  "installed": true,
+  "enabled": true,
+  "source": "system-file",
+  "runtime": {
+    "kind": "server",
+    "adapter": "agentim.skill-action"
+  },
+  "inputSchema": {
+    "type": "object"
+  },
+  "outputSchema": {
+    "type": "object"
+  },
+  "permissions": {
+    "network": {
+      "hosts": [
+        "wttr.in",
+        "api.open-meteo.com",
+        "geocoding-api.open-meteo.com"
+      ],
+      "allowHttp": false,
+      "allowLocalhost": false,
+      "allowPrivateNetwork": false
+    },
+    "secrets": [],
+    "approval": "auto"
+  },
+  "actions": [
+    {
+      "id": "summary",
+      "name": "Get Weather Summary",
+      "type": "http",
+      "method": "GET",
+      "url": "https://wttr.in/${input.location}",
+      "query": {
+        "format": "3"
+      },
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "location"
+        ],
+        "properties": {
+          "location": {
+            "type": "string"
+          }
+        }
+      },
+      "response": {
+        "mode": "text",
+        "maxBytes": 12000
+      }
+    },
+    {
+      "id": "forecast",
+      "name": "Get Weather Forecast",
+      "type": "http",
+      "method": "GET",
+      "url": "https://wttr.in/${input.location}",
+      "query": {
+        "format": "v2"
+      },
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "location"
+        ],
+        "properties": {
+          "location": {
+            "type": "string"
+          }
+        }
+      },
+      "response": {
+        "mode": "text",
+        "maxBytes": 30000
+      }
+    },
+    {
+      "id": "json",
+      "name": "Get Weather JSON",
+      "type": "http",
+      "method": "GET",
+      "url": "https://wttr.in/${input.location}",
+      "query": {
+        "format": "j1"
+      },
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "location"
+        ],
+        "properties": {
+          "location": {
+            "type": "string"
+          }
+        }
+      },
+      "response": {
+        "mode": "json",
+        "maxBytes": 60000
+      }
+    },
+    {
+      "id": "geocode",
+      "name": "Find Location Coordinates",
+      "type": "http",
+      "method": "GET",
+      "url": "https://geocoding-api.open-meteo.com/v1/search",
+      "query": {
+        "name": "${input.location}",
+        "count": "1",
+        "language": "en",
+        "format": "json"
+      },
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "location"
+        ],
+        "properties": {
+          "location": {
+            "type": "string"
+          }
+        }
+      },
+      "response": {
+        "mode": "json",
+        "maxBytes": 20000
+      }
+    },
+    {
+      "id": "current",
+      "name": "Get Current Weather",
+      "type": "http",
+      "method": "GET",
+      "url": "https://api.open-meteo.com/v1/forecast",
+      "query": {
+        "latitude": "${input.latitude}",
+        "longitude": "${input.longitude}",
+        "current": "temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m",
+        "timezone": "auto"
+      },
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "latitude",
+          "longitude"
+        ],
+        "properties": {
+          "latitude": {
+            "type": "number"
+          },
+          "longitude": {
+            "type": "number"
+          }
+        }
+      },
+      "response": {
+        "mode": "json",
+        "maxBytes": 30000
+      }
+    }
+  ],
+  "policy": {
+    "workspace": "none",
+    "network": true,
+    "destructive": false
+  },
+  "ui": {
+    "card": "skill-result"
+  },
+  "riskLevel": "low",
+  "requiresApproval": false,
+  "description": "Look up current weather, forecasts, weather JSON, and coordinate-based weather data through public no-key weather APIs. Use for ordinary weather questions, not historical climate analysis or severe weather alerts."
+}

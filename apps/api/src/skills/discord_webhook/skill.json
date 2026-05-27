@@ -1,0 +1,108 @@
+{
+  "id": "discord_webhook",
+  "name": "Discord Webhook",
+  "version": "0.1.0",
+  "category": "integration",
+  "common": false,
+  "installed": true,
+  "enabled": true,
+  "source": "system-file",
+  "runtime": {
+    "kind": "server",
+    "adapter": "agentim.skill-action"
+  },
+  "inputSchema": {
+    "type": "object"
+  },
+  "outputSchema": {
+    "type": "object"
+  },
+  "permissions": {
+    "network": {
+      "hosts": [
+        "discord.com",
+        "discordapp.com"
+      ],
+      "allowHttp": false,
+      "allowLocalhost": false,
+      "allowPrivateNetwork": false
+    },
+    "secrets": [],
+    "approval": "balanced"
+  },
+  "credentialTypes": {
+    "discordWebhookApi": {
+      "name": "Discord Webhook",
+      "fields": [
+        {
+          "name": "webhookUri",
+          "label": "Webhook URL",
+          "type": "secret",
+          "required": true
+        }
+      ]
+    }
+  },
+  "credentials": [
+    {
+      "type": "discordWebhookApi",
+      "multiple": true
+    }
+  ],
+  "actions": [
+    {
+      "id": "send",
+      "name": "Send Message",
+      "type": "http",
+      "credentialType": "discordWebhookApi",
+      "method": "POST",
+      "url": "${credential.webhookUri}",
+      "headers": {
+        "content-type": "application/json",
+        "accept": "application/json"
+      },
+      "body": {
+        "content": "${input.content}",
+        "username": "${input.username}",
+        "avatar_url": "${input.avatarUrl}",
+        "tts": "${input.tts}"
+      },
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "username": {
+            "type": "string"
+          },
+          "avatarUrl": {
+            "type": "string"
+          },
+          "tts": {
+            "type": "boolean"
+          }
+        }
+      },
+      "response": {
+        "mode": "json",
+        "maxBytes": 20000
+      }
+    }
+  ],
+  "policy": {
+    "workspace": "none",
+    "network": true,
+    "destructive": false,
+    "externalEffect": true
+  },
+  "ui": {
+    "card": "skill-result"
+  },
+  "riskLevel": "medium",
+  "requiresApproval": false,
+  "description": "Send a message to a Discord channel through a Discord webhook URL. Use only when the user explicitly asks to send or post a Discord message."
+}

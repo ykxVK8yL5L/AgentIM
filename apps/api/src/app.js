@@ -32,6 +32,9 @@ const DEFAULT_ROLE_LOOKUP = new Map(DEFAULT_ROLES.map((role) => [role.id, role])
 const AUTH_COOKIE = 'agentim_session';
 const AUTH_SESSION_VALUE = 'authenticated';
 const AUTH_SECRET = process.env.AGENTIM_AUTH_SECRET ?? randomBytes(32).toString('hex');
+const API_STARTED_AT = new Date().toISOString();
+const API_INSTANCE_ID = randomBytes(4).toString('hex');
+const API_VERSION = '0.1.0';
 const WEB_READ_TIMEOUT_MS = 20000;
 const WEB_READ_MAX_BYTES = 512000;
 const WEB_READ_MAX_TEXT_CHARS = 60000;
@@ -124,8 +127,53 @@ function publicAuth(auth, authenticated = false) {
 function publicSettings(settings, c) {
   return {
     ...settings,
-    auth: publicAuth(settings?.auth, c ? isAuthenticated(c, settings) : false)
+    auth: publicAuth(settings?.auth, c ? isAuthenticated(c, settings) : false),
+    secrets: publicSecrets(settings?.secrets),
+    credentials: publicCredentials(settings?.credentials)
   };
+}
+
+function publicRuntimeInfo() {
+  return {
+    version: API_VERSION,
+    instanceId: API_INSTANCE_ID,
+    startedAt: API_STARTED_AT
+  };
+}
+
+function publicSecrets(secrets = []) {
+  return Array.isArray(secrets)
+    ? secrets.map((secret) => ({
+      id: secret.id,
+      name: secret.name,
+      hasValue: Boolean(secret.value),
+      createdAt: secret.createdAt,
+      updatedAt: secret.updatedAt
+    }))
+    : [];
+}
+
+function publicCredentials(credentials = []) {
+  return Array.isArray(credentials)
+    ? credentials.map((credential) => ({
+      id: credential.id,
+      type: credential.type,
+      name: credential.name,
+      values: redactCredentialValuesForPublic(credential.values),
+      createdAt: credential.createdAt,
+      updatedAt: credential.updatedAt
+    }))
+    : [];
+}
+
+function redactCredentialValuesForPublic(values = {}) {
+  if (!values || typeof values !== 'object' || Array.isArray(values)) return {};
+  return Object.fromEntries(Object.entries(values).map(([key, value]) => {
+    if (value && typeof value === 'object' && value.secret === true) {
+      return [key, { secret: true, hasValue: Boolean(value.value) }];
+    }
+    return [key, value];
+  }));
 }
 
 function setAuthCookie(c, settings) {
@@ -285,7 +333,7 @@ app.use('/api/*', async (c, next) => {
 });
 
 app.get('/api/health', async (c) => {
-  return c.json({ ok: true, service: 'agentim-api' });
+  return c.json({ ok: true, service: 'agentim-api', runtime: publicRuntimeInfo() });
 });
 
 app.get('/api/bootstrap', async (c) => {
@@ -293,6 +341,7 @@ app.get('/api/bootstrap', async (c) => {
   const boot = await store.bootstrap();
   return c.json({
     ...boot,
+    runtime: publicRuntimeInfo(),
     settings: publicSettings(boot.settings, c),
     providers: boot.providers.map(publicProvider)
   });
@@ -357,6 +406,14 @@ app.post('/api/auth/logout', async (c) => {
   return c.json({ ok: true });
 });
 
+async function readOptionalJson(c) {
+  try {
+    return await c.req.json();
+  } catch {
+    return {};
+  }
+}
+
 app.post('/api/auth/password', async (c) => {
   const store = c.get('store');
   const settings = await store.getSettings();
@@ -394,6 +451,7 @@ app.patch('/api/settings', async (c) => {
     : Boolean(input.network?.proxyEnabled);
   const proxyUrl = String(input.network?.proxyUrl ?? current.network?.proxyUrl ?? '').trim();
   const providerTimeoutMs = normalizeProviderTimeoutInput(input.network?.providerTimeoutMs ?? current.network?.providerTimeoutMs);
+  const apiRequest = normalizeApiRequestSettingsInput(input.apiRequest ?? current.apiRequest);
   const messagePageSize = normalizeMessagePageSizeInput(input.chat?.messagePageSize ?? current.chat?.messagePageSize);
   const approvalMode = normalizeApprovalModeInput(input.approvals?.mode ?? current.approvals?.mode);
 
@@ -414,6 +472,7 @@ app.patch('/api/settings', async (c) => {
       proxyUrl,
       providerTimeoutMs
     },
+    apiRequest,
     chat: {
       messagePageSize
     },
@@ -423,12 +482,146 @@ app.patch('/api/settings', async (c) => {
   }), c));
 });
 
+app.post('/api/settings/secrets', async (c) => {
+  const store = c.get('store');
+  const input = await c.req.json();
+  const settings = await store.getSettings();
+  const name = normalizeSecretName(input.name);
+  const value = String(input.value ?? '');
+  if (!name) return c.json({ ok: false, error: 'secret_name_required' }, 400);
+  if (!value) return c.json({ ok: false, error: 'secret_value_required' }, 400);
+  const now = new Date().toISOString();
+  const existing = Array.isArray(settings.secrets)
+    ? settings.secrets.find((secret) => secret.name === name)
+    : null;
+  const secrets = [
+    ...(settings.secrets ?? []).filter((secret) => secret.name !== name),
+    {
+      id: existing?.id ?? randomBytes(8).toString('hex'),
+      name,
+      value,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now
+    }
+  ].sort((a, b) => a.name.localeCompare(b.name));
+  const next = await store.updateSettings({ secrets });
+  return c.json({ ok: true, secrets: publicSecrets(next.secrets) });
+});
+
+app.delete('/api/settings/secrets/:name', async (c) => {
+  const store = c.get('store');
+  const settings = await store.getSettings();
+  const name = normalizeSecretName(c.req.param('name'));
+  const secrets = (settings.secrets ?? []).filter((secret) => secret.name !== name);
+  const next = await store.updateSettings({ secrets });
+  return c.json({ ok: true, secrets: publicSecrets(next.secrets) });
+});
+
+app.post('/api/settings/credentials', async (c) => {
+  const store = c.get('store');
+  const input = await c.req.json();
+  const settings = await store.getSettings();
+  const skills = await store.listSkills();
+  const credentialTypes = credentialTypesFromRegistry(skills, settings);
+  const type = String(input.type ?? '').trim();
+  const schema = credentialTypes.find((item) => item.id === type);
+  if (!schema) return c.json({ ok: false, error: 'credential_type_not_found' }, 404);
+  const name = String(input.name ?? '').trim();
+  if (!name) return c.json({ ok: false, error: 'credential_name_required' }, 400);
+  const current = input.id
+    ? (settings.credentials ?? []).find((credential) => credential.id === String(input.id))
+    : null;
+  const values = normalizeCredentialInputValues(input.values ?? {}, schema, current?.values);
+  const missing = (schema.fields ?? [])
+    .filter((field) => field.required && credentialFieldValueEmpty(values[field.name]))
+    .map((field) => field.name);
+  if (missing.length > 0) return c.json({ ok: false, error: `credential_fields_required:${missing.join(',')}` }, 400);
+  const now = new Date().toISOString();
+  const credential = {
+    id: current?.id ?? randomBytes(8).toString('hex'),
+    type,
+    name,
+    values,
+    createdAt: current?.createdAt ?? now,
+    updatedAt: now
+  };
+  const credentials = [
+    ...(settings.credentials ?? []).filter((item) => item.id !== credential.id),
+    credential
+  ].sort((a, b) => a.name.localeCompare(b.name));
+  const next = await store.updateSettings({ credentials });
+  return c.json({ ok: true, credentials: publicCredentials(next.credentials) });
+});
+
+app.delete('/api/settings/credentials/:id', async (c) => {
+  const store = c.get('store');
+  const settings = await store.getSettings();
+  const id = String(c.req.param('id') ?? '').trim();
+  const credentials = (settings.credentials ?? []).filter((credential) => credential.id !== id);
+  const next = await store.updateSettings({ credentials });
+  return c.json({ ok: true, credentials: publicCredentials(next.credentials) });
+});
+
+app.post('/api/settings/credentials/:id/test', async (c) => {
+  const store = c.get('store');
+  const settings = await store.getSettings();
+  const skills = await store.listSkills();
+  const credential = (settings.credentials ?? []).find((item) => item.id === String(c.req.param('id')));
+  if (!credential) return c.json({ ok: false, error: 'credential_not_found' }, 404);
+  const result = testCredentialConfiguration(credential, skills, settings);
+  return c.json(result, result.ok ? 200 : 400);
+});
+
+app.get('/api/settings/credential-types', async (c) => {
+  const store = c.get('store');
+  const settings = await store.getSettings();
+  const skills = await store.listSkills();
+  return c.json({
+    ok: true,
+    credentialTypes: credentialTypesFromRegistry(skills, settings),
+    customCredentialTypes: settings.customCredentialTypes ?? []
+  });
+});
+
+app.post('/api/settings/credential-types', async (c) => {
+  const store = c.get('store');
+  const input = await c.req.json();
+  const settings = await store.getSettings();
+  const parsed = normalizeCustomCredentialTypeInput(input);
+  if (!parsed.ok) return c.json({ ok: false, error: parsed.error }, 400);
+  const current = (settings.customCredentialTypes ?? []).find((type) => type.id === parsed.type.id);
+  const now = new Date().toISOString();
+  const credentialType = {
+    ...parsed.type,
+    source: 'user',
+    createdAt: current?.createdAt ?? now,
+    updatedAt: now
+  };
+  const customCredentialTypes = [
+    ...(settings.customCredentialTypes ?? []).filter((type) => type.id !== credentialType.id),
+    credentialType
+  ].sort((a, b) => a.name.localeCompare(b.name));
+  const next = await store.updateSettings({ customCredentialTypes });
+  return c.json({ ok: true, customCredentialTypes: next.customCredentialTypes ?? [] });
+});
+
+app.delete('/api/settings/credential-types/:id', async (c) => {
+  const store = c.get('store');
+  const settings = await store.getSettings();
+  const id = String(c.req.param('id') ?? '').trim();
+  const customCredentialTypes = (settings.customCredentialTypes ?? []).filter((type) => type.id !== id);
+  const next = await store.updateSettings({ customCredentialTypes });
+  return c.json({ ok: true, customCredentialTypes: next.customCredentialTypes ?? [] });
+});
+
 app.post('/api/model-providers/probe', async (c) => {
   const store = c.get('store');
   const input = await c.req.json();
+  const provider = input.providerId ? await store.getProvider(String(input.providerId)) : null;
+  if (input.providerId && !provider) return c.json({ ok: false, error: 'provider_not_found' }, 404);
   const result = await probeOpenAICompatibleProvider({
-    baseUrl: input.baseUrl,
-    apiKey: input.apiKey
+    baseUrl: input.baseUrl ?? provider?.baseUrl,
+    apiKey: String(input.apiKey ?? '').trim() || provider?.apiKey
   }, await createProviderDeps(store));
   return c.json(result, result.ok ? 200 : 400);
 });
@@ -913,7 +1106,10 @@ app.post('/api/skill-approvals/:id/approve', async (c) => {
   if (approval.status !== 'pending') return c.json({ ok: false, error: 'skill_approval_already_decided' }, 409);
 
   try {
-    const result = await approveSkillApproval(store, approval, 'user');
+    const input = await readOptionalJson(c);
+    const result = await approveSkillApproval(store, approval, 'user', {
+      trustScope: input.trustScope
+    });
     return c.json({ ok: true, ...result });
   } catch (error) {
     return workspaceError(c, error);
@@ -948,6 +1144,22 @@ app.post('/api/skill-approvals/:id/reject', async (c) => {
     pending: false
   });
   return c.json({ ok: true, approval: updatedApproval, invocation });
+});
+
+app.post('/api/skill-approvals/:id/revoke-trust', async (c) => {
+  const store = c.get('store');
+  const approval = await store.getSkillApproval(c.req.param('id'));
+  if (!approval) return c.json({ ok: false, error: 'skill_approval_not_found' }, 404);
+  if (approval.input?.trustScope !== 'room') return c.json({ ok: false, error: 'skill_approval_trust_not_found' }, 404);
+  const updatedApproval = await store.updateSkillApproval(approval.id, {
+    input: {
+      ...approval.input,
+      trustScope: '',
+      trustRevokedAt: new Date().toISOString()
+    }
+  });
+  publishResourceEvent('skill_approval.updated', { roomId: approval.roomId, approvalId: approval.id });
+  return c.json({ ok: true, approval: updatedApproval });
 });
 
 app.get('/api/rooms/:roomId/artifacts', async (c) => {
@@ -1163,13 +1375,20 @@ app.post('/api/rooms', async (c) => {
   const input = await c.req.json();
   const name = String(input.name ?? 'New Room').trim();
   if (!name) return c.json({ ok: false, error: 'name_required' }, 400);
-  const existing = await findRoomByName(store, name, input.type);
+  const dmAgentId = input.dmAgentId ? String(input.dmAgentId) : undefined;
+  const existingDm = input.type === 'dm' && dmAgentId
+    ? await findDmRoomByAgentId(store, dmAgentId)
+    : null;
+  if (existingDm) return c.json(existingDm);
+  const existing = input.type === 'dm' && dmAgentId
+    ? null
+    : await findRoomByName(store, name, input.type);
   if (existing) return c.json({ ok: false, error: 'room_name_exists', room: existing }, 409);
   const room = await store.createRoom({
     name,
     type: input.type,
     description: String(input.description ?? ''),
-    dmAgentId: input.dmAgentId ? String(input.dmAgentId) : undefined
+    dmAgentId
   });
   publishResourceEvent('room.created', { roomId: room.id });
   return c.json(room, 201);
@@ -1214,13 +1433,20 @@ app.post('/api/conversations', async (c) => {
   const store = c.get('store');
   const input = await c.req.json();
   const name = String(input.name ?? 'New Conversation').trim();
-  const existing = await findRoomByName(store, name, input.type);
+  const dmAgentId = input.dmAgentId ? String(input.dmAgentId) : undefined;
+  const existingDm = input.type === 'dm' && dmAgentId
+    ? await findDmRoomByAgentId(store, dmAgentId)
+    : null;
+  if (existingDm) return c.json(existingDm);
+  const existing = input.type === 'dm' && dmAgentId
+    ? null
+    : await findRoomByName(store, name, input.type);
   if (existing) return c.json({ ok: false, error: 'room_name_exists', room: existing }, 409);
   const room = await store.createRoom({
     name,
     type: input.type,
     description: String(input.description ?? ''),
-    dmAgentId: input.dmAgentId ? String(input.dmAgentId) : undefined
+    dmAgentId
   });
   publishResourceEvent('room.created', { roomId: room.id });
   return c.json(room, 201);
@@ -2661,7 +2887,7 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
       const role = await store.getRole(agent.roleId);
       const skills = await store.listSkills();
       providerMessages = [
-        { role: 'system', content: buildAgentSystemPrompt(agent, roomAgents, workspaceContext, role, skills, workspaceScope) },
+        { role: 'system', content: buildAgentSystemPrompt(agent, roomAgents, workspaceContext, role, skills, workspaceScope, await store.getSettings()) },
         ...recent
       ];
       await clearStaleProviderInvocations(store, run);
@@ -2806,6 +3032,50 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
         }), agent.name);
       }
     }
+    const apiRequests = await applyApiRequestActions(store, run, content, signal);
+    if (apiRequests.length > 0) {
+      const apiRequestText = formatApiRequestResults(apiRequests);
+      content = `${content}\n\n${apiRequestText}`;
+      content = stripRepeatedSpeakerPrefix(content, agent.name);
+      await store.updateMessage(run.messageId, {
+        content,
+        status: 'running',
+        pending: true
+      });
+      if (provider.baseUrl !== 'mock://provider') {
+        content = stripRepeatedSpeakerPrefix(await continueAgentAfterToolResults(store, run, {
+          agent,
+          provider,
+          messages: providerMessages,
+          previousContent: content,
+          toolResultText: apiRequestText,
+          providerDiagnostics,
+          signal
+        }), agent.name);
+      }
+    }
+    const skillActions = await applySkillActionBlocks(store, run, content, signal);
+    if (skillActions.length > 0) {
+      const skillActionText = formatSkillActionResults(skillActions);
+      content = `${content}\n\n${skillActionText}`;
+      content = stripRepeatedSpeakerPrefix(content, agent.name);
+      await store.updateMessage(run.messageId, {
+        content,
+        status: 'running',
+        pending: true
+      });
+      if (provider.baseUrl !== 'mock://provider') {
+        content = stripRepeatedSpeakerPrefix(await continueAgentAfterToolResults(store, run, {
+          agent,
+          provider,
+          messages: providerMessages,
+          previousContent: content,
+          toolResultText: skillActionText,
+          providerDiagnostics,
+          signal
+        }), agent.name);
+      }
+    }
     const workspaceReads = await applyWorkspaceReadActions(store, run, content, workspaceScope);
     if (workspaceReads.length > 0) {
       content = `${content}\n\n${formatWorkspaceReadResults(workspaceReads)}`;
@@ -2867,7 +3137,7 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
         roomId: run.roomId,
         senderType: 'system',
         senderName: 'AgentIM',
-        content: `Platform actions completed: ${platformActions.map((action) => action.summary).join('; ')}.`,
+        content: formatPlatformActionSystemMessage(platformActions),
         status: 'done',
         pending: false
       });
@@ -2909,7 +3179,7 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
             roomId: run.roomId,
             senderType: 'system',
             senderName: 'AgentIM',
-            content: `Platform actions completed: ${followupPlatformActions.map((action) => action.summary).join('; ')}.`,
+            content: formatPlatformActionSystemMessage(followupPlatformActions),
             status: 'done',
             pending: false
           });
@@ -2976,13 +3246,15 @@ async function runBackgroundAgentRun(store, runId, signal, running) {
       return;
     }
     if (signal.aborted && running?.abortReason === AGENT_RUN_ABORT_TIMEOUT) {
+      const timeoutError = `provider_timeout_after_${normalizeProviderTimeoutInput((await createProviderDeps(store)).timeoutMs)}ms`;
       if (providerInvocation) {
         await store.updateSkillInvocation(providerInvocation.id, {
           status: 'failed',
-          error: `provider_timeout_after_${normalizeProviderTimeoutInput((await createProviderDeps(store)).timeoutMs)}ms`,
+          error: timeoutError,
           completedAt: new Date().toISOString()
         });
       }
+      await failAgentRun(store, run, timeoutError, content);
       return;
     }
     if (providerInvocation) {
@@ -3038,6 +3310,7 @@ async function continueAgentAfterToolResults(store, run, options) {
         'The platform executed the requested action and returned these results:',
         truncateToolResultText(toolResultText),
         '',
+        'If a selected credential was used, do not retry with a different credential after a failure. Report the failure and wait for the user to choose another credential.',
         'Continue the original user request now. Use the results above to produce the final answer or emit the next controlled action block if one is required. Do not stop after merely reading data.'
       ].join('\n')
     }
@@ -3124,6 +3397,32 @@ function formatPlatformActionResults(actions) {
   ].join('\n')).join('\n\n');
 }
 
+function formatPlatformActionSystemMessage(actions) {
+  const summary = `Platform actions completed: ${actions.map((action) => action.summary).join('; ')}.`;
+  const details = actions
+    .map(formatPlatformActionSystemDetail)
+    .filter(Boolean);
+  return details.length > 0
+    ? [summary, '', ...details].join('\n')
+    : summary;
+}
+
+function formatPlatformActionSystemDetail(action) {
+  if (action.action === 'provider.probe') {
+    const output = action.output ?? {};
+    const models = Array.isArray(output.models) ? output.models.filter((model) => model?.id) : [];
+    if (models.length > 0) {
+      const visible = models.slice(0, 40).map((model) => `- ${model.id}`).join('\n');
+      const more = models.length > 40 ? `\n- ...and ${models.length - 40} more` : '';
+      return `Available models (${models.length}):\n${visible}${more}`;
+    }
+    if (output.ok === false) {
+      return `Provider probe failed: ${[output.stage, output.message].filter(Boolean).join(' - ') || 'unknown error'}.`;
+    }
+  }
+  return '';
+}
+
 function truncateToolResultText(value) {
   const text = String(value ?? '');
   const maxChars = 24000;
@@ -3168,6 +3467,7 @@ async function startMentionedAgentRuns(store, run, content) {
 }
 
 async function failAgentRun(store, run, error, partialContent = '') {
+  const displayError = formatUserFacingExecutionError(error);
   const failedRun = await store.updateAgentRun(run.id, {
     status: 'failed',
     error,
@@ -3175,8 +3475,8 @@ async function failAgentRun(store, run, error, partialContent = '') {
   });
   const failedMessage = await store.updateMessage(run.messageId, {
     content: partialContent
-      ? `${partialContent}\n\n[Provider error: ${error}]`
-      : `Provider error: ${error}`,
+      ? `${partialContent}\n\n[Action error: ${displayError}]`
+      : `Action error: ${displayError}`,
     status: 'failed',
     pending: false
   });
@@ -3184,6 +3484,38 @@ async function failAgentRun(store, run, error, partialContent = '') {
   publishMessageEvent(failedMessage);
   await completeScheduledTaskForRun(store, run.id, 'failed', error);
   await completeProjectTaskForRun(store, run, 'failed', error, partialContent);
+}
+
+function formatUserFacingExecutionError(error) {
+  const raw = String(error ?? 'unknown_error');
+  if (raw === 'missing_api_key') return 'Missing API key. Add or update the provider API key, then try again.';
+  if (raw.startsWith('provider_timeout_after_')) {
+    const ms = raw.match(/provider_timeout_after_(\d+)ms/)?.[1];
+    return ms ? `Provider timed out after ${ms} ms. You can retry or increase Provider Timeout in Settings.` : 'Provider timed out.';
+  }
+  if (raw.startsWith('credential_required:')) {
+    return 'Credential selection is required. Choose one credential in the chat before the skill runs.';
+  }
+  if (raw.startsWith('missing_credential:')) {
+    return `Missing credential for ${raw.split(':')[1] || 'this skill'}. Add it in Settings -> Secrets.`;
+  }
+  if (raw.startsWith('credential_not_found:')) {
+    return `Credential not found: ${raw.split(':').slice(1).join(':') || 'unknown'}.`;
+  }
+  if (raw.startsWith('credential_switch_not_allowed:')) {
+    return 'Credential switching was blocked for this attempt. Ask explicitly to use another credential if you want a fallback.';
+  }
+  if (raw === 'api_request_disabled') return 'API requests are disabled in Settings -> Network.';
+  if (raw.startsWith('missing_secret:')) return `Missing secret: ${raw.split(':')[1] || 'unknown'}. Add it in Settings -> Secrets.`;
+  if (raw === 'invalid_api_request_url' || raw === 'api_request_url_must_be_http_or_https' || raw === 'web_read_url_must_be_http_or_https') return 'The request URL must be a valid HTTP or HTTPS URL.';
+  if (raw === 'api_request_host_not_allowed' || raw === 'skill_action_host_not_allowed') return 'The target host is blocked by the current network policy.';
+  if (raw === 'api_request_http_not_allowed' || raw === 'skill_action_http_not_allowed') return 'HTTP requests are disabled by the current network policy.';
+  if (raw === 'api_request_localhost_not_allowed' || raw === 'skill_action_localhost_not_allowed') return 'Localhost requests are disabled by the current network policy.';
+  if (raw === 'api_request_private_network_not_allowed' || raw === 'skill_action_private_network_not_allowed') return 'Private network requests are disabled by the current network policy.';
+  if (raw === 'approval_rejected') return 'The requested action was rejected.';
+  if (raw.startsWith('agent_missing_')) return 'The agent does not have the required skill. Add the skill to its role and try again.';
+  if (raw.startsWith('missing_action_input:')) return `Missing required input: ${raw.split(':')[1] || 'unknown'}.`;
+  return raw;
 }
 
 function formatEmptyProviderResponse(diagnostics = {}) {
@@ -3426,6 +3758,546 @@ function webReadInvocationOutput(result) {
   };
 }
 
+async function applyApiRequestActions(store, run, content, signal) {
+  const requests = parseApiRequestBlocks(content);
+  if (requests.length === 0) return [];
+
+  const agent = await store.getAgent(run.agentId);
+  const skills = await store.listSkills();
+  if (!await agentHasSkill(store, agent, 'api.request', skills)) {
+    throw new Error('agent_missing_api_request_skill');
+  }
+
+  const settings = await store.getSettings();
+  if (settings.apiRequest?.enabled === false) throw new Error('api_request_disabled');
+
+  const results = [];
+  for (const request of requests) {
+    const invocation = await store.createSkillInvocation({
+      skillId: 'api.request',
+      roomId: run.roomId,
+      runId: run.id,
+      messageId: run.messageId,
+      agentId: run.agentId,
+      actorType: 'agent',
+      status: 'running',
+      input: redactSecretsInValue(request, settings.secrets),
+      startedAt: new Date().toISOString()
+    });
+    try {
+      const result = await executeApiRequest(store, request, { settings, signal });
+      results.push(result);
+      await store.updateSkillInvocation(invocation.id, {
+        status: 'done',
+        output: apiRequestInvocationOutput(result),
+        completedAt: new Date().toISOString()
+      });
+    } catch (error) {
+      await store.updateSkillInvocation(invocation.id, {
+        status: 'failed',
+        error: error instanceof Error ? error.message : String(error),
+        completedAt: new Date().toISOString()
+      });
+      throw error;
+    }
+  }
+  return results;
+}
+
+async function executeApiRequest(store, request, options = {}) {
+  const settings = options.settings ?? await store.getSettings();
+  const apiSettings = settings.apiRequest ?? {};
+  const method = normalizeApiRequestMethod(request.method);
+  const url = normalizeApiRequestUrl(request.url, apiSettings);
+  const headers = normalizeApiRequestHeaders(replaceSecretsInValue(request.headers ?? {}, settings.secrets));
+  const bodyValue = replaceSecretsInValue(request.body, settings.secrets);
+  const hasBody = !['GET', 'HEAD'].includes(method) && bodyValue !== undefined && bodyValue !== null;
+  const body = hasBody
+    ? typeof bodyValue === 'string'
+      ? bodyValue
+      : JSON.stringify(bodyValue)
+    : undefined;
+  if (hasBody && !hasHeader(headers, 'content-type') && typeof bodyValue !== 'string') {
+    headers['content-type'] = 'application/json';
+  }
+  if (!hasHeader(headers, 'accept')) headers.accept = 'application/json,text/plain;q=0.9,*/*;q=0.5';
+
+  const deps = await createProviderDeps(store);
+  const fetchFn = deps.fetch ?? fetch;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), normalizeApiRequestTimeout(apiSettings.timeoutMs));
+  const signal = mergeAbortSignals(options.signal, controller.signal);
+  try {
+    const response = await fetchFn(url.href, {
+      method,
+      headers,
+      body,
+      redirect: 'manual',
+      signal
+    });
+    const contentType = response.headers.get('content-type') ?? '';
+    const raw = await readResponseTextLimited(response, normalizeApiRequestMaxBytes(apiSettings.maxResponseBytes));
+    const redactedBody = redactSecretsInText(raw, settings.secrets);
+    return {
+      ok: response.ok,
+      method,
+      url: url.href,
+      status: response.status,
+      statusText: response.statusText,
+      contentType,
+      headers: publicResponseHeaders(response.headers),
+      body: redactedBody,
+      truncated: raw.length >= normalizeApiRequestMaxBytes(apiSettings.maxResponseBytes)
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function apiRequestInvocationOutput(result) {
+  return {
+    ok: result.ok,
+    method: result.method,
+    url: result.url,
+    status: result.status,
+    contentType: result.contentType,
+    bodyLength: result.body.length,
+    truncated: result.truncated
+  };
+}
+
+function formatApiRequestResults(results) {
+  return results.map((result) => [
+    `API request: ${result.method} ${result.url}`,
+    `Status: ${result.status} ${result.statusText}`,
+    `Content-Type: ${result.contentType || 'unknown'}`,
+    'Response:',
+    result.body || '(empty)'
+  ].join('\n')).join('\n\n');
+}
+
+async function applySkillActionBlocks(store, run, content, signal) {
+  const requests = parseSkillActionBlocks(content);
+  if (requests.length === 0) return [];
+
+  const agent = await store.getAgent(run.agentId);
+  const skills = await store.listSkills();
+  const settings = await store.getSettings();
+  if (settings.apiRequest?.enabled === false) throw new Error('api_request_disabled');
+
+  const results = [];
+  const executedKeys = new Set();
+  for (const request of requests) {
+    if (!await agentHasSkill(store, agent, request.skillId, skills)) {
+      throw new Error(`agent_missing_${request.skillId.replaceAll('.', '_')}_skill`);
+    }
+    const skill = skills.find((item) => item.id === request.skillId);
+    const action = findSkillAction(skill, request.action);
+    if (!skill || !action) throw new Error('skill_action_not_found');
+    if (action.type !== 'http') throw new Error('unsupported_skill_action_type');
+    validateSkillActionInput(action, request.input ?? {});
+    assertRequiredSkillSecretsAvailable(skill, settings.secrets);
+    const choice = requiredCredentialChoice(skill, action, request, settings.credentials);
+    if (choice) {
+      const message = await store.createMessage({
+        roomId: run.roomId,
+        senderType: 'system',
+        senderName: 'AgentIM',
+        content: formatCredentialChoiceMessage({
+          ...choice,
+          agentId: run.agentId,
+          skillId: skill.id,
+          skillName: skill.name,
+          actionId: action.id,
+          actionName: action.name ?? action.id,
+          input: request.input ?? {}
+        }),
+        status: 'done',
+        pending: false
+      });
+      publishMessageEvent(message, 'message.created');
+      return results;
+    }
+    const credential = resolveSkillActionCredential(skill, action, request, settings.credentials);
+    await assertCredentialNotSwitchedInRun(store, run, results, skill, action, credential);
+    const actionKey = skillActionExecutionKey(skill, action, request, credential);
+    if (executedKeys.has(actionKey)) continue;
+    executedKeys.add(actionKey);
+    const credentialSecrets = credential ? credentialSecretsForRedaction(credential) : [];
+    if (shouldRequireApprovalForSkill(skill, settings) && !await hasTrustedSkillApproval(store, run.roomId, skill, action, credential)) {
+      const invocation = await store.createSkillInvocation({
+        skillId: skill.id,
+        roomId: run.roomId,
+        runId: run.id,
+        messageId: run.messageId,
+        agentId: run.agentId,
+        actorType: 'agent',
+        status: 'approval_required',
+        input: redactSecretsInValue(request, settings.secrets),
+        startedAt: new Date().toISOString()
+      });
+      const approval = await store.createSkillApproval({
+        roomId: run.roomId,
+        invocationId: invocation.id,
+        skillId: skill.id,
+        status: 'pending',
+        title: `${skill.name} · ${action.name ?? action.id}`,
+        reason: 'This Skill action has external effects or elevated risk and requires confirmation.',
+        input: {
+          kind: 'skill_action',
+          skillId: skill.id,
+          actionId: action.id,
+          credential: credential?.id ?? credential?.name,
+          credentialName: credential?.name,
+          trustKey: trustedApprovalKey(skill, action, credential),
+          request: {
+            skillId: request.skillId,
+            action: request.action,
+            input: request.input ?? {}
+          }
+        },
+        requestedBy: agent?.name ?? 'agent'
+      });
+      const message = await store.createMessage({
+        roomId: run.roomId,
+        senderType: 'system',
+        senderName: 'AgentIM',
+        content: formatSkillApprovalRequiredMessage(approval, skill, action),
+        status: 'done',
+        pending: false
+      });
+      publishMessageEvent(message, 'message.created');
+      publishResourceEvent('skill_approval.created', { roomId: run.roomId, approvalId: approval.id });
+      return results;
+    }
+
+    const invocation = await store.createSkillInvocation({
+      skillId: skill.id,
+      roomId: run.roomId,
+      runId: run.id,
+      messageId: run.messageId,
+      agentId: run.agentId,
+      actorType: 'agent',
+      status: 'running',
+      input: redactSecretsInValue(request, settings.secrets),
+      startedAt: new Date().toISOString()
+    });
+    try {
+      const result = await executeHttpSkillAction(store, skill, action, request.input ?? {}, {
+        settings: { ...settings, secrets: [...(settings.secrets ?? []), ...credentialSecrets] },
+        signal,
+        credential
+      });
+      results.push({
+        skillId: skill.id,
+        skillName: skill.name,
+        actionId: action.id,
+        actionName: action.name ?? action.id,
+        credentialId: credential?.id,
+        credentialName: credential?.name,
+        result
+      });
+      await store.updateSkillInvocation(invocation.id, {
+        status: 'done',
+        output: {
+          skillId: skill.id,
+          actionId: action.id,
+          credentialId: credential?.id,
+          credentialName: credential?.name,
+          ...apiRequestInvocationOutput(result)
+        },
+        completedAt: new Date().toISOString()
+      });
+    } catch (error) {
+      await store.updateSkillInvocation(invocation.id, {
+        status: 'failed',
+        error: error instanceof Error ? error.message : String(error),
+        completedAt: new Date().toISOString()
+      });
+      throw error;
+    }
+  }
+  return results;
+}
+
+async function executeHttpSkillAction(store, skill, action, input, options = {}) {
+  const settings = options.settings ?? await store.getSettings();
+  const credentialValues = credentialTemplateValues(options.credential);
+  const effectiveInput = {
+    ...credentialInputDefaults(options.credential),
+    ...(input ?? {})
+  };
+  const url = renderSkillTemplateValue(action.url, effectiveInput, settings.secrets, credentialValues);
+  const requestUrl = new URL(String(url ?? '').trim());
+  const query = renderSkillTemplateValue(action.query ?? {}, effectiveInput, settings.secrets, credentialValues);
+  for (const [key, value] of Object.entries(query)) {
+    if (value === undefined || value === null || value === '') continue;
+    requestUrl.searchParams.set(key, String(value));
+  }
+  validateSkillActionNetworkPermissions(skill, action, requestUrl);
+  return executeApiRequest(store, {
+    method: action.method,
+    url: requestUrl.href,
+    headers: pruneEmptySkillValue(renderSkillTemplateValue(action.headers ?? {}, effectiveInput, settings.secrets, credentialValues)),
+    body: pruneEmptySkillValue(renderSkillTemplateValue(action.body, effectiveInput, settings.secrets, credentialValues))
+  }, {
+    settings,
+    signal: options.signal
+  });
+}
+
+function findSkillAction(skill, actionId) {
+  const id = String(actionId ?? '').trim();
+  return (skill?.actions ?? []).find((action) => String(action?.id ?? '').trim() === id) ?? null;
+}
+
+function resolveSkillActionCredential(skill, action, request, credentials = []) {
+  const credentialType = String(action.credentialType ?? skill.credentials?.[0]?.type ?? '').trim();
+  if (!credentialType) return null;
+  const candidates = (credentials ?? []).filter((credential) => credential.type === credentialType);
+  if (candidates.length === 0) throw new Error(`missing_credential:${credentialType}`);
+  const requested = String(request.credential ?? request.credentialId ?? request.credentialName ?? '').trim();
+  if (!requested) {
+    if (candidates.length > 1) {
+      throw new Error(`credential_required:${credentialType}:${candidates.map((credential) => credential.name).join(',')}`);
+    }
+    return candidates[0];
+  }
+  const credential = candidates.find((item) => item.id === requested || item.name === requested);
+  if (!credential) throw new Error(`credential_not_found:${requested}`);
+  return credential;
+}
+
+async function assertCredentialNotSwitchedInRun(store, run, results, skill, action, credential) {
+  if (!credential) return;
+  const previous = results.find((item) =>
+    item.skillId === skill.id &&
+    item.actionId === action.id &&
+    item.credentialId &&
+    item.credentialId !== credential.id
+  );
+  if (previous && !await userAllowedCredentialFallback(store, run, credential)) {
+    throw new Error(`credential_switch_not_allowed:${skill.id}.${action.id}`);
+  }
+}
+
+async function userAllowedCredentialFallback(store, run, credential) {
+  const content = (await latestUserMessageContentBefore(store, run.roomId, run.messageId)).toLowerCase();
+  if (!content) return false;
+  const credentialNamed = [credential?.name, credential?.id]
+    .map((value) => String(value ?? '').trim().toLowerCase())
+    .filter(Boolean)
+    .some((value) => content.includes(value));
+  if (!credentialNamed) return false;
+  return /(失败|失敗|不成功|报错|錯誤|错误|fail|failed|failure|error|fallback|备用|備用|切换|切換|换|換|改用|再试|重试|retry|try)/i.test(content);
+}
+
+async function latestUserMessageContentBefore(store, roomId, beforeMessageId) {
+  const messages = await store.listMessages(roomId);
+  const beforeIndex = messages.findIndex((message) => message.id === beforeMessageId);
+  const earlier = beforeIndex >= 0 ? messages.slice(0, beforeIndex) : messages;
+  const message = [...earlier].reverse().find((item) => item.senderType === 'user');
+  return String(message?.content ?? '');
+}
+
+function skillActionExecutionKey(skill, action, request, credential) {
+  return JSON.stringify({
+    skillId: skill.id,
+    actionId: action.id,
+    credentialId: credential?.id ?? '',
+    input: request.input ?? {}
+  });
+}
+
+function requiredCredentialChoice(skill, action, request, credentials = []) {
+  const credentialType = String(action.credentialType ?? skill.credentials?.[0]?.type ?? '').trim();
+  if (!credentialType) return null;
+  const candidates = (credentials ?? []).filter((credential) => credential.type === credentialType);
+  const requested = String(request.credential ?? request.credentialId ?? request.credentialName ?? '').trim();
+  if (requested && candidates.some((credential) => credential.id === requested || credential.name === requested)) return null;
+  if (candidates.length <= 1) return null;
+  return {
+    credentialType,
+    credentials: candidates.map((credential) => ({
+      id: credential.id,
+      name: credential.name
+    }))
+  };
+}
+
+function formatCredentialChoiceMessage(choice) {
+  return [
+    'Credential selection required.',
+    '```agentim-credential-choice',
+    JSON.stringify(choice, null, 2),
+    '```'
+  ].join('\n');
+}
+
+function trustedApprovalKey(skill, action, credential) {
+  return [
+    skill?.id,
+    action?.id,
+    credential?.id ?? 'none'
+  ].map((value) => String(value ?? '').trim()).join(':');
+}
+
+async function hasTrustedSkillApproval(store, roomId, skill, action, credential) {
+  const approvals = await store.listSkillApprovals(roomId, { limit: 200 });
+  const key = trustedApprovalKey(skill, action, credential);
+  return approvals.some((approval) =>
+    approval.status === 'approved' &&
+    approval.input?.kind === 'skill_action' &&
+    approval.input?.trustScope === 'room' &&
+    approval.input?.trustKey === key
+  );
+}
+
+function formatSkillApprovalRequiredMessage(approval, skill, action) {
+  return [
+    'Skill approval required.',
+    '```agentim-skill-approval',
+    JSON.stringify({
+      approvalId: approval.id,
+      title: approval.title,
+      reason: approval.reason,
+      skillId: skill.id,
+      skillName: skill.name,
+      actionId: action.id,
+      actionName: action.name ?? action.id
+    }, null, 2),
+    '```'
+  ].join('\n');
+}
+
+function credentialSecretsForRedaction(credential) {
+  return Object.entries(credential?.values ?? {})
+    .filter(([, value]) => value && typeof value === 'object' && value.secret === true && value.value)
+    .map(([name, value]) => ({ name: `credential.${name}`, value: value.value }));
+}
+
+function assertRequiredSkillSecretsAvailable(skill, secrets = []) {
+  const required = Array.isArray(skill?.permissions?.secrets) ? skill.permissions.secrets : [];
+  if (required.length === 0) return;
+  const available = new Set((secrets ?? [])
+    .filter((secret) => secret?.name && secret.value)
+    .map((secret) => secret.name));
+  const missing = required.filter((name) => !available.has(name));
+  if (missing.length > 0) throw new Error(`missing_secret:${missing.join(',')}`);
+}
+
+function validateSkillActionInput(action, input = {}) {
+  const required = Array.isArray(action?.inputSchema?.required) ? action.inputSchema.required : [];
+  const missing = required.filter((name) => {
+    const value = getPathValue(input, name);
+    return value === undefined || value === null || value === '';
+  });
+  if (missing.length > 0) throw new Error(`missing_action_input:${missing.join(',')}`);
+}
+
+function formatSkillActionResults(actions) {
+  return actions.map((action) => [
+    `Skill action result: ${action.skillId}.${action.actionId}`,
+    `Summary: ${action.skillName} / ${action.actionName}`,
+    action.credentialName ? `Credential: ${action.credentialName}` : '',
+    `Status: ${action.result.status} ${action.result.statusText}`,
+    `Content-Type: ${action.result.contentType || 'unknown'}`,
+    'Response:',
+    action.result.body || '(empty)',
+    action.credentialName
+      ? 'Credential lock: Do not retry this action with a different credential. If this failed, report the failure for this selected credential and wait for the user to choose another one.'
+      : ''
+  ].filter(Boolean).join('\n')).join('\n\n');
+}
+
+function validateSkillActionNetworkPermissions(skill, action, url) {
+  const network = action.permissions?.network ?? skill.permissions?.network ?? {};
+  const hostname = url.hostname.toLowerCase();
+  const hosts = Array.isArray(network.hosts) ? network.hosts : [];
+  if (hosts.length > 0 && !apiRequestHostAllowed(hostname, hosts)) {
+    throw new Error('skill_action_host_not_allowed');
+  }
+  if (url.protocol === 'http:' && network.allowHttp === false) {
+    throw new Error('skill_action_http_not_allowed');
+  }
+  if (isLocalWebHost(hostname) && network.allowLocalhost === false) {
+    throw new Error('skill_action_localhost_not_allowed');
+  }
+  if (isPrivateNetworkHost(hostname) && network.allowPrivateNetwork === false) {
+    throw new Error('skill_action_private_network_not_allowed');
+  }
+}
+
+function renderSkillTemplateValue(value, input, secrets = [], credentialValues = {}) {
+  if (value === undefined) return undefined;
+  if (typeof value === 'string') {
+    const exactInput = value.match(/^\$\{input\.([a-zA-Z0-9_.-]+)\}$/);
+    if (exactInput) {
+      const resolved = getPathValue(input, exactInput[1]);
+      return resolved === undefined || resolved === null ? '' : resolved;
+    }
+    const exactCredential = value.match(/^\$\{credential\.([a-zA-Z0-9_.-]+)\}$/);
+    if (exactCredential) {
+      const resolved = getPathValue(credentialValues, exactCredential[1]);
+      return resolved === undefined || resolved === null ? '' : resolved;
+    }
+    const withInput = value.replace(/\$\{input\.([a-zA-Z0-9_.-]+)\}/g, (_match, path) => {
+      const resolved = getPathValue(input, path);
+      return resolved === undefined || resolved === null ? '' : String(resolved);
+    });
+    const withCredential = withInput.replace(/\$\{credential\.([a-zA-Z0-9_.-]+)\}/g, (_match, path) => {
+      const resolved = getPathValue(credentialValues, path);
+      return resolved === undefined || resolved === null ? '' : String(resolved);
+    });
+    return replaceSecretsInText(withCredential, secrets);
+  }
+  if (Array.isArray(value)) return value.map((item) => renderSkillTemplateValue(item, input, secrets, credentialValues));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, renderSkillTemplateValue(item, input, secrets, credentialValues)]));
+  }
+  return value;
+}
+
+function credentialTemplateValues(credential) {
+  const values = credential?.values && typeof credential.values === 'object' && !Array.isArray(credential.values)
+    ? credential.values
+    : {};
+  return Object.fromEntries(Object.entries(values).map(([key, value]) => {
+    if (value && typeof value === 'object' && value.secret === true) return [key, value.value ?? ''];
+    return [key, value];
+  }));
+}
+
+function credentialInputDefaults(credential) {
+  const values = credentialTemplateValues(credential);
+  const defaults = { ...values };
+  delete defaults.device_key;
+  delete defaults.server_url;
+  return defaults;
+}
+
+function getPathValue(value, path) {
+  return String(path ?? '').split('.').reduce((current, key) => {
+    if (current === undefined || current === null) return undefined;
+    return current[key];
+  }, value);
+}
+
+function pruneEmptySkillValue(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map(pruneEmptySkillValue)
+      .filter((item) => item !== undefined);
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value)
+      .map(([key, item]) => [key, pruneEmptySkillValue(item)])
+      .filter(([, item]) => item !== undefined));
+  }
+  if (value === '') return undefined;
+  return value;
+}
+
 function normalizeWebReadUrl(rawUrl) {
   let parsed;
   try {
@@ -3443,6 +4315,75 @@ function normalizeWebReadUrl(rawUrl) {
   return parsed;
 }
 
+function normalizeApiRequestUrl(rawUrl, settings = {}) {
+  let parsed;
+  try {
+    parsed = new URL(String(rawUrl ?? '').trim());
+  } catch {
+    throw new Error('invalid_api_request_url');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('api_request_url_must_be_http_or_https');
+  }
+  if (parsed.protocol === 'http:' && settings.allowHttp === false) {
+    throw new Error('api_request_http_not_allowed');
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  if (isLocalWebHost(hostname) && settings.allowLocalhost === false) {
+    throw new Error('api_request_localhost_not_allowed');
+  }
+  if (isPrivateNetworkHost(hostname) && settings.allowPrivateNetwork === false) {
+    throw new Error('api_request_private_network_not_allowed');
+  }
+  if (settings.allowlistEnabled && !apiRequestHostAllowed(hostname, settings.allowedHosts)) {
+    throw new Error('api_request_host_not_allowed');
+  }
+  parsed.hash = '';
+  return parsed;
+}
+
+function apiRequestHostAllowed(hostname, allowedHosts = []) {
+  const host = String(hostname ?? '').toLowerCase();
+  return (allowedHosts ?? []).some((entry) => {
+    const allowed = String(entry ?? '').toLowerCase();
+    if (!allowed) return false;
+    if (allowed.startsWith('*.')) return host === allowed.slice(2) || host.endsWith(allowed.slice(1));
+    return host === allowed;
+  });
+}
+
+function normalizeApiRequestMethod(value) {
+  const method = String(value ?? 'GET').trim().toUpperCase();
+  return ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'].includes(method) ? method : 'GET';
+}
+
+function normalizeApiRequestHeaders(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const headers = {};
+  for (const [key, rawValue] of Object.entries(value).slice(0, 64)) {
+    const name = String(key ?? '').trim().toLowerCase();
+    if (!name || name.includes('\n') || name.includes('\r')) continue;
+    if (['host', 'content-length'].includes(name)) continue;
+    headers[name] = String(rawValue ?? '');
+  }
+  return headers;
+}
+
+function hasHeader(headers, name) {
+  const requested = String(name ?? '').toLowerCase();
+  return Object.keys(headers).some((key) => key.toLowerCase() === requested);
+}
+
+function publicResponseHeaders(headers) {
+  const output = {};
+  for (const [key, value] of headers.entries()) {
+    const name = key.toLowerCase();
+    if (['set-cookie', 'authorization', 'proxy-authenticate'].includes(name)) continue;
+    output[name] = value;
+  }
+  return output;
+}
+
 function isLocalWebHost(hostname) {
   const host = String(hostname ?? '').toLowerCase();
   return host === 'localhost'
@@ -3450,6 +4391,16 @@ function isLocalWebHost(hostname) {
     || host === '0.0.0.0'
     || host === '::1'
     || host.endsWith('.local');
+}
+
+function isPrivateNetworkHost(hostname) {
+  const host = String(hostname ?? '').toLowerCase();
+  if (host === 'localhost' || host.endsWith('.local')) return true;
+  if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+  if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(host)) return true;
+  const match = host.match(/^172\.(\d{1,2})\.\d{1,3}\.\d{1,3}$/);
+  if (match && Number(match[1]) >= 16 && Number(match[1]) <= 31) return true;
+  return host === '127.0.0.1' || host === '0.0.0.0' || host === '::1';
 }
 
 function parseGitHubRepoUrl(url) {
@@ -4595,7 +5546,11 @@ async function executePlatformAction(store, run, request, workspaceScope, skills
     const result = input.listModels || input.models
       ? await listOpenAICompatibleModels({ baseUrl, apiKey }, await createProviderDeps(store))
       : await probeOpenAICompatibleProvider({ baseUrl, apiKey }, await createProviderDeps(store));
-    return platformResult('probed provider', result);
+    const modelCount = Array.isArray(result.models) ? result.models.length : 0;
+    return platformResult(
+      modelCount > 0 ? `probed provider: ${modelCount} models available` : 'probed provider',
+      result
+    );
   }
   throw new Error(`unsupported_platform_action:${request.action}`);
 }
@@ -4640,6 +5595,7 @@ async function updatePlatformSettings(store, input) {
     : Boolean(input.network?.proxyEnabled);
   const proxyUrl = String(input.network?.proxyUrl ?? current.network?.proxyUrl ?? '').trim();
   const providerTimeoutMs = normalizeProviderTimeoutInput(input.network?.providerTimeoutMs ?? current.network?.providerTimeoutMs);
+  const apiRequest = normalizeApiRequestSettingsInput(input.apiRequest ?? current.apiRequest);
   const messagePageSize = normalizeMessagePageSizeInput(input.chat?.messagePageSize ?? current.chat?.messagePageSize);
   const approvalMode = normalizeApprovalModeInput(input.approvals?.mode ?? current.approvals?.mode);
 
@@ -4661,6 +5617,7 @@ async function updatePlatformSettings(store, input) {
       proxyUrl,
       providerTimeoutMs
     },
+    apiRequest,
     chat: {
       messagePageSize
     },
@@ -4902,6 +5859,13 @@ async function findRoomByName(store, name, type) {
   )) ?? null;
 }
 
+async function findDmRoomByAgentId(store, agentId) {
+  const requested = String(agentId ?? '').trim();
+  if (!requested) return null;
+  const rooms = await store.listRooms();
+  return rooms.find((room) => room.type === 'dm' && room.dmAgentId === requested) ?? null;
+}
+
 async function uniqueRoomName(store, name, type) {
   const base = String(name ?? '').trim() || 'New Room';
   if (!await findRoomByName(store, base, type)) return base;
@@ -5026,6 +5990,45 @@ function parseWebReadBlocks(content) {
     });
   }
   return dedupeWebReadBlocks(blocks).slice(0, 4);
+}
+
+function parseApiRequestBlocks(content) {
+  const blocks = [];
+  const pattern = /```agentim-api-request\s*\n([\s\S]*?)```/g;
+  for (const match of String(content ?? '').matchAll(pattern)) {
+    const payload = parseJsonBlock(match[1]);
+    if (!payload) continue;
+    const url = String(payload.url ?? '').trim();
+    if (!url) continue;
+    blocks.push({
+      method: payload.method,
+      url,
+      headers: payload.headers,
+      body: payload.body
+    });
+  }
+  return blocks.slice(0, 6);
+}
+
+function parseSkillActionBlocks(content) {
+  const blocks = [];
+  const pattern = /```agentim-skill-action\s*\n([\s\S]*?)```/g;
+  for (const match of String(content ?? '').matchAll(pattern)) {
+    const payload = parseJsonBlock(match[1]);
+    if (!payload) continue;
+    const skillId = String(payload.skillId ?? payload.skill ?? '').trim();
+    const action = String(payload.action ?? payload.actionId ?? '').trim();
+    if (!skillId || !action) continue;
+    blocks.push({
+      skillId,
+      action,
+      credential: payload.credential ?? payload.credentialId ?? payload.credentialName,
+      input: payload.input && typeof payload.input === 'object' && !Array.isArray(payload.input)
+        ? payload.input
+        : {}
+    });
+  }
+  return blocks.slice(0, 8);
 }
 
 function dedupeWebReadBlocks(blocks) {
@@ -5330,7 +6333,11 @@ async function withRoomWorkspace(store, roomId) {
   return { ok: true, room, workspace };
 }
 
-async function approveSkillApproval(store, approval, decidedBy = 'user') {
+async function approveSkillApproval(store, approval, decidedBy = 'user', options = {}) {
+  if (approval.input?.kind === 'skill_action') {
+    return approveSkillActionApproval(store, approval, decidedBy, options);
+  }
+
   if (approval.skillId !== 'workspace.delete') {
     const decidedAt = new Date().toISOString();
     const updatedApproval = await store.updateSkillApproval(approval.id, {
@@ -5387,6 +6394,86 @@ async function approveSkillApproval(store, approval, decidedBy = 'user') {
     workspace: result.workspace,
     path
   };
+}
+
+async function approveSkillActionApproval(store, approval, decidedBy = 'user', options = {}) {
+  const skillId = String(approval.input?.skillId ?? approval.skillId ?? '').trim();
+  const actionId = String(approval.input?.actionId ?? approval.input?.request?.action ?? '').trim();
+  const settings = await store.getSettings();
+  const skills = await store.listSkills();
+  const skill = skills.find((item) => item.id === skillId);
+  const action = findSkillAction(skill, actionId);
+  if (!skill || !action) throw new Error('skill_action_not_found');
+  const request = approval.input?.request && typeof approval.input.request === 'object'
+    ? approval.input.request
+    : {};
+  const credentials = settings.credentials ?? [];
+  const credentialRef = String(approval.input?.credential ?? request.credential ?? '').trim();
+  const credential = credentialRef
+    ? credentials.find((item) => item.id === credentialRef || item.name === credentialRef)
+    : resolveSkillActionCredential(skill, action, request, credentials);
+  if (!credential && String(action.credentialType ?? skill.credentials?.[0]?.type ?? '').trim()) {
+    throw new Error(`credential_not_found:${credentialRef || action.credentialType}`);
+  }
+  const credentialSecrets = credential ? credentialSecretsForRedaction(credential) : [];
+  const decidedAt = new Date().toISOString();
+  try {
+    const result = await executeHttpSkillAction(store, skill, action, request.input ?? {}, {
+      settings: { ...settings, secrets: [...(settings.secrets ?? []), ...credentialSecrets] },
+      credential
+    });
+    const approvalInput = options.trustScope === 'room'
+      ? {
+        ...approval.input,
+        trustScope: 'room',
+        trustKey: approval.input?.trustKey ?? trustedApprovalKey(skill, action, credential)
+      }
+      : approval.input;
+    const updatedApproval = await store.updateSkillApproval(approval.id, {
+      status: 'approved',
+      decidedBy,
+      decidedAt,
+      input: approvalInput
+    });
+    const invocation = approval.invocationId
+      ? await store.updateSkillInvocation(approval.invocationId, {
+        status: 'done',
+        output: {
+          skillId: skill.id,
+          actionId: action.id,
+          ...apiRequestInvocationOutput(result)
+        },
+        completedAt: decidedAt
+      })
+      : null;
+    const message = await store.createMessage({
+      roomId: approval.roomId,
+      senderType: 'system',
+      senderName: 'AgentIM',
+      content: formatSkillActionResults([{
+      skillId: skill.id,
+      skillName: skill.name,
+      actionId: action.id,
+      actionName: action.name ?? action.id,
+      credentialId: credential?.id,
+      credentialName: credential?.name,
+      result
+    }]),
+      status: 'done',
+      pending: false
+    });
+    publishMessageEvent(message, 'message.created');
+    return { approval: updatedApproval, invocation };
+  } catch (error) {
+    if (approval.invocationId) {
+      await store.updateSkillInvocation(approval.invocationId, {
+        status: 'failed',
+        error: error instanceof Error ? error.message : String(error),
+        completedAt: new Date().toISOString()
+      });
+    }
+    throw error;
+  }
 }
 
 async function normalizeAgentRoleId(store, inputRoleId) {
@@ -5446,6 +6533,18 @@ function normalizeSkillManifestInput(input) {
   const outputSchema = input.outputSchema === undefined
     ? { type: 'object' }
     : input.outputSchema;
+  const permissions = input.permissions === undefined
+    ? {}
+    : input.permissions;
+  const credentialTypes = input.credentialTypes === undefined
+    ? {}
+    : input.credentialTypes;
+  const credentials = input.credentials === undefined
+    ? []
+    : input.credentials;
+  const actions = input.actions === undefined
+    ? []
+    : input.actions;
   const policy = input.policy === undefined
     ? { workspace: 'none', network: false, destructive: false }
     : input.policy;
@@ -5453,9 +6552,12 @@ function normalizeSkillManifestInput(input) {
     ? { card: 'skill-result' }
     : input.ui;
 
-  for (const [key, value] of Object.entries({ runtime, inputSchema, outputSchema, policy, ui })) {
+  for (const [key, value] of Object.entries({ runtime, inputSchema, outputSchema, credentialTypes, permissions, policy, ui })) {
     if (!isPlainObject(value)) return { ok: false, error: `${key}_must_be_object` };
   }
+  if (!Array.isArray(credentials)) return { ok: false, error: 'credentials_must_be_array' };
+  if (!Array.isArray(actions)) return { ok: false, error: 'actions_must_be_array' };
+  if (actions.some((action) => !isPlainObject(action))) return { ok: false, error: 'actions_must_be_objects' };
 
   const riskLevel = String(input.riskLevel ?? 'medium');
   if (!['low', 'medium', 'high'].includes(riskLevel)) {
@@ -5476,6 +6578,10 @@ function normalizeSkillManifestInput(input) {
       runtime,
       inputSchema,
       outputSchema,
+      credentialTypes,
+      credentials,
+      permissions,
+      actions,
       policy,
       ui,
       riskLevel,
@@ -5485,7 +6591,7 @@ function normalizeSkillManifestInput(input) {
 }
 
 function isValidSkillId(id) {
-  return /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$/.test(id);
+  return /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/.test(id);
 }
 
 function isPlainObject(value) {
@@ -5589,7 +6695,7 @@ async function streamAgentReply(c, roomId, agentId) {
           const role = await store.getRole(agent.roleId);
           const skills = await store.listSkills();
           const messages = [
-            { role: 'system', content: buildAgentSystemPrompt(agent, roomAgents, '', role, skills) },
+            { role: 'system', content: buildAgentSystemPrompt(agent, roomAgents, '', role, skills, undefined, await store.getSettings()) },
             ...recent
           ];
           const providerDeps = await createProviderDeps(store);
@@ -5665,6 +6771,8 @@ async function* mockAgentStream(agent, recent, signal) {
     .trim() ?? 'Product Room';
   const baseText = last.toLowerCase().includes('workspace write block')
     ? `${agent.name}: mock workspace write requested.\n\n\`\`\`agentim-write-file path="hello-web/index.html"\nhello from mock\n\`\`\``
+    : last.toLowerCase().includes('smoke skill action block')
+      ? `${agent.name}: mock skill action requested.\n\n\`\`\`agentim-skill-action\n{"skillId":"smoke.http","action":"ping","input":{}}\n\`\`\``
     : last.toLowerCase().includes('room create block')
       ? `${agent.name}: mock room create requested.\n\n\`\`\`agentim-room-create\n{"name":"Mock Managed Room","description":"Created by mock AgentIM room management flow","agents":["Helper Agent"]}\n\`\`\``
     : last.toLowerCase().includes('room assign block')
@@ -5720,8 +6828,9 @@ async function resolveReplyTo(store, roomId, replyToMessageId) {
 }
 
 function formatMessageForContext(message, context = {}) {
-  const replyContext = message.replyTo && !isInternalProviderErrorContent(message.replyTo.content)
-    ? ` (replying to ${message.replyTo.senderName}: ${message.replyTo.content})`
+  const replyContent = message.replyTo ? formatMessageContentForContext(message.replyTo, context) : '';
+  const replyContext = message.replyTo && !isInternalProviderErrorContent(replyContent)
+    ? ` (replying to ${message.replyTo.senderName}: ${replyContent})`
     : '';
   const content = formatMessageContentForContext(message, context);
   if (message.senderType === 'agent') {
@@ -5740,8 +6849,13 @@ function stripRepeatedSpeakerPrefix(content, speakerName) {
 
 function formatMessageContentForContext(message, context = {}) {
   const content = String(message.content ?? '');
+  if (isCredentialChoiceContent(content)) return 'Credential selection was requested.';
   if (context.room?.type !== 'dm' || message.senderType !== 'user') return content;
   return stripDirectRoomAddressing(content, context.roomAgents);
+}
+
+function isCredentialChoiceContent(content) {
+  return /```agentim-credential-choice\s*\n[\s\S]*?```/.test(String(content ?? ''));
 }
 
 function stripDirectRoomAddressing(content, roomAgents = []) {
@@ -5768,12 +6882,14 @@ function isInternalProviderErrorMessage(message) {
 function isInternalProviderErrorContent(content) {
   return (
     content.includes('[Provider error:') ||
+    content.includes('[Action error:') ||
+    content.includes('Action error:') ||
     content.includes('Provider error: webidl.util.markAsUncloneable') ||
     content.includes('webidl.util.markAsUncloneable is not a function')
   );
 }
 
-function buildAgentSystemPrompt(agent, roomAgents, workspaceContext = '', role, registrySkills = [], workspaceScope) {
+function buildAgentSystemPrompt(agent, roomAgents, workspaceContext = '', role, registrySkills = [], workspaceScope, settings = {}) {
   const peerNames = roomAgents
     .filter((item) => item.id !== agent.id)
     .map((item) => `@${item.name}`);
@@ -5799,6 +6915,10 @@ function buildAgentSystemPrompt(agent, roomAgents, workspaceContext = '', role, 
   const webRead = skillSet.has('web.read')
     ? `\n\nYou can read public web pages and public GitHub repositories by emitting a controlled block:\n\`\`\`agentim-web-read\n{"url":"https://example.com","maxFiles":12}\n\`\`\`\nUse web.read when the user gives you a URL, asks you to inspect external docs/code, or asks you to analyze a GitHub project before applying ideas to this workspace. For GitHub repository URLs, the platform returns repository metadata, file tree highlights, README/package files, and selected source files. After reading, continue the user's original task using the returned content.`
     : '\n\nYou do not have web.read enabled. Do not claim to open URLs, browse websites, or inspect GitHub links.';
+  const apiRequest = skillSet.has('api.request')
+    ? `\n\nYou can call HTTP and HTTPS APIs by emitting this controlled JSON block:\n\`\`\`agentim-api-request\n{"method":"GET","url":"http://localhost:8787/api/health","headers":{"accept":"application/json"},"body":null}\n\`\`\`\nUse api.request when the user asks you to call an API, inspect an endpoint, query local services, or validate JSON responses. You may use configured secrets with placeholders such as \${secret:GITHUB_TOKEN}; do not ask the user to paste secret values into chat. The platform applies API request settings for allowlists, local/private network access, HTTP access, timeout, and response size.`
+    : '\n\nYou do not have api.request enabled. Do not claim to call arbitrary APIs.';
+  const skillActions = buildSkillActionPrompt(registrySkills, skillIds, settings.credentials);
   const workspaceRead = skillSet.has('workspace.read')
     ? `\n\nYou can inspect the ${workspaceScope?.isExternal ? `target room workspace (${workspaceScope.room.name})` : 'current room workspace'} by emitting controlled fenced blocks.\n\nList a directory:\n\`\`\`agentim-list-dir path=\"relative/dir\"\`\`\`\nUse an empty path to list the workspace root:\n\`\`\`agentim-list-dir path=\"\"\`\`\`\n\nRead a file:\n\`\`\`agentim-read-file path=\"relative/path.txt\"\`\`\`\n\nUse these read blocks when you need file contents before answering or editing.`
     : '\n\nYou do not have workspace.read enabled. Do not claim to read workspace files.';
@@ -5821,13 +6941,53 @@ function buildAgentSystemPrompt(agent, roomAgents, workspaceContext = '', role, 
   const userApproval = skillSet.has('user.request_approval')
     ? `\n\nWhen you need an explicit user decision, emit a controlled approval request block:\n\`\`\`agentim-approval-request\n{\n  "title": "Decision title",\n  "reason": "Why approval is needed",\n  "approveLabel": "Approve",\n  "rejectLabel": "Reject",\n  "details": ["optional detail"]\n}\n\`\`\`\nUse this for risky, costly, ambiguous, or user-owned decisions.`
     : '\n\nYou do not have user.request_approval enabled. Mention @user in plain text for decisions instead.';
-  return `${legacyAgentPrompt}${rolePrompt}${collaboration}\n\nThe human user is @user. Mention @user when you need confirmation, missing requirements, or a decision from the user. @user is not an automated Agent.${approvalGuidance}${skills}${roleDirectory}${roleCreate}${platformActions}${webRead}${workspace}${workspaceRead}${workspaceWrite}${roomMessaging}${roomCreate}${roomAssign}${taskPlanning}${userApproval}`;
+  return `${legacyAgentPrompt}${rolePrompt}${collaboration}\n\nThe human user is @user. Mention @user when you need confirmation, missing requirements, or a decision from the user. @user is not an automated Agent.${approvalGuidance}${skills}${roleDirectory}${roleCreate}${platformActions}${webRead}${apiRequest}${skillActions}${workspace}${workspaceRead}${workspaceWrite}${roomMessaging}${roomCreate}${roomAssign}${taskPlanning}${userApproval}`;
 }
 
 function formatRoleDirectory() {
   return DEFAULT_ROLES
     .map((role) => `${role.id} (${role.name}: ${role.description})`)
     .join('; ');
+}
+
+function buildSkillActionPrompt(registrySkills = [], skillIds = [], credentials = []) {
+  const enabled = new Set(skillIds);
+  const actionSkills = registrySkills
+    .filter((skill) => enabled.has(skill.id) && Array.isArray(skill.actions) && skill.actions.length > 0)
+    .slice(0, 12);
+  if (actionSkills.length === 0) {
+    return '\n\nNo API-backed Skill actions are currently available to this Agent.';
+  }
+  const lines = actionSkills.map((skill) => {
+    const credentialTypes = [...new Set((skill.actions ?? [])
+      .map((action) => action.credentialType)
+      .filter(Boolean))];
+    const credentialText = credentialTypes
+      .map((type) => {
+        const names = (credentials ?? [])
+          .filter((credential) => credential.type === type)
+          .map((credential) => credential.name)
+          .slice(0, 12);
+        return names.length > 1
+          ? `${type} credentials: ${names.length} configured; omit credential unless the user explicitly named one`
+          : names.length === 1
+            ? `${type} credentials: 1 configured; credential may be omitted`
+          : `${type} credentials: none configured`;
+      })
+      .join('; ');
+    const actions = skill.actions
+      .slice(0, 8)
+      .map((action) => {
+        const required = Array.isArray(action.inputSchema?.required) && action.inputSchema.required.length > 0
+          ? ` input: ${action.inputSchema.required.join(', ')}`
+          : '';
+        const label = action.name ? `${action.id} (${action.name})` : action.id;
+        return `${label}${required}`;
+      })
+      .join('; ');
+    return `${skill.id} (${skill.name}): ${actions}${credentialText ? `; ${credentialText}` : ''}`;
+  });
+  return `\n\nYou can call installed API-backed Skill actions by emitting a controlled JSON block:\n\`\`\`agentim-skill-action\n{"skillId":"weather","action":"geocode","input":{"location":"Shanghai"}}\n\`\`\`\nFor credential-backed actions, set "credential" only when the user explicitly named a credential in the current request. If multiple credentials are configured and the user did not specify which one, omit "credential"; the platform will ask the user to choose. Never guess, infer, or choose a credential by yourself. If an action fails after using a selected credential, do not switch credentials unless the user explicitly requested a fallback credential in the same request or chooses another credential afterward. Available Skill actions: ${lines.join(' | ')}. Use these before raw api.request when a matching Skill exists. If an action needs output from another action, call the first action, then continue with the returned result. Do not claim a Skill action completed unless you emitted the block.`;
 }
 
 function buildPlatformActionPrompt(skillSet) {
@@ -6450,6 +7610,263 @@ function normalizeProviderTimeoutInput(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return 300000;
   return Math.max(Math.round(number), 5000);
+}
+
+function normalizeApiRequestSettingsInput(value = {}) {
+  return {
+    enabled: value.enabled === undefined ? true : Boolean(value.enabled),
+    allowlistEnabled: Boolean(value.allowlistEnabled),
+    allowedHosts: normalizeApiRequestAllowedHosts(value.allowedHosts),
+    allowHttp: value.allowHttp === undefined ? true : Boolean(value.allowHttp),
+    allowLocalhost: value.allowLocalhost === undefined ? true : Boolean(value.allowLocalhost),
+    allowPrivateNetwork: value.allowPrivateNetwork === undefined ? true : Boolean(value.allowPrivateNetwork),
+    timeoutMs: normalizeApiRequestTimeout(value.timeoutMs),
+    maxResponseBytes: normalizeApiRequestMaxBytes(value.maxResponseBytes)
+  };
+}
+
+function normalizeApiRequestAllowedHosts(value) {
+  const rows = Array.isArray(value)
+    ? value
+    : String(value ?? '').split(/[\n,]/);
+  return [...new Set(rows
+    .map((item) => String(item ?? '').trim().toLowerCase())
+    .filter(Boolean)
+    .slice(0, 200))];
+}
+
+function normalizeApiRequestTimeout(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 30000;
+  return Math.min(Math.max(Math.round(number), 1000), 300000);
+}
+
+function normalizeApiRequestMaxBytes(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 512000;
+  return Math.min(Math.max(Math.round(number), 1024), 5 * 1024 * 1024);
+}
+
+function normalizeSecretName(value) {
+  return String(value ?? '').trim().replace(/\s+/g, '_').slice(0, 80);
+}
+
+function credentialTypesFromSkills(skills = []) {
+  const byId = new Map();
+  for (const skill of skills ?? []) {
+    const types = skill?.credentialTypes && typeof skill.credentialTypes === 'object' && !Array.isArray(skill.credentialTypes)
+      ? skill.credentialTypes
+      : {};
+    for (const [id, raw] of Object.entries(types)) {
+      if (!id || byId.has(id)) continue;
+      byId.set(id, normalizeCredentialType(id, raw, skill));
+    }
+  }
+  return [...byId.values()];
+}
+
+function credentialTypesFromRegistry(skills = [], settings = {}) {
+  const byId = new Map(credentialTypesFromSkills(skills).map((type) => [type.id, type]));
+  for (const type of settings.customCredentialTypes ?? []) {
+    if (!type?.id) continue;
+    byId.set(type.id, {
+      id: type.id,
+      name: type.name ?? type.id,
+      source: 'user',
+      fields: Array.isArray(type.fields) ? type.fields : []
+    });
+  }
+  return [...byId.values()];
+}
+
+function testCredentialConfiguration(credential, skills = [], settings = {}) {
+  const schema = credentialTypesFromRegistry(skills, settings).find((item) => item.id === credential.type);
+  const checks = [];
+  if (!schema) {
+    checks.push({ name: 'Credential type', status: 'failed', message: `Type "${credential.type}" is not registered.` });
+    return { ok: false, credential: publicCredentials([credential])[0], checks, usedBy: [] };
+  }
+
+  checks.push({ name: 'Credential type', status: 'passed', message: schema.name ?? schema.id });
+  for (const field of schema.fields ?? []) {
+    const value = credential.values?.[field.name];
+    if (field.required && credentialFieldValueEmpty(value)) {
+      checks.push({ name: field.label ?? field.name, status: 'failed', message: 'Required value is missing.' });
+      continue;
+    }
+    if (field.type === 'url' && !credentialFieldValueEmpty(value)) {
+      try {
+        new URL(String(value));
+        checks.push({ name: field.label ?? field.name, status: 'passed', message: 'URL is valid.' });
+      } catch {
+        checks.push({ name: field.label ?? field.name, status: 'failed', message: 'URL is invalid.' });
+      }
+    }
+  }
+
+  const usedBy = [];
+  const credentialValues = credentialTemplateValues(credential);
+  for (const skill of skills) {
+    for (const action of skill.actions ?? []) {
+      const credentialType = String(action.credentialType ?? skill.credentials?.[0]?.type ?? '').trim();
+      if (credentialType !== credential.type) continue;
+      const label = `${skill.id}.${action.id}`;
+      usedBy.push(label);
+      if (action.type !== 'http') {
+        checks.push({ name: label, status: 'skipped', message: 'Only HTTP actions can be dry-run checked.' });
+        continue;
+      }
+      try {
+        const inputDefaults = credentialInputDefaults(credential);
+        const rendered = renderSkillTemplateValue(action.url, inputDefaults, settings.secrets, credentialValues);
+        const url = new URL(String(rendered ?? '').trim());
+        validateSkillActionNetworkPermissions(skill, action, url);
+        checks.push({ name: label, status: 'passed', message: `Dry-run URL allowed: ${url.origin}` });
+      } catch (error) {
+        checks.push({
+          name: label,
+          status: 'failed',
+          message: formatUserFacingExecutionError(error instanceof Error ? error.message : String(error))
+        });
+      }
+    }
+  }
+  if (usedBy.length === 0) {
+    checks.push({ name: 'Skill usage', status: 'skipped', message: 'No installed skill action currently uses this credential type.' });
+  }
+
+  return {
+    ok: checks.every((check) => check.status !== 'failed'),
+    credential: publicCredentials([credential])[0],
+    checks,
+    usedBy
+  };
+}
+
+function normalizeCustomCredentialTypeInput(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return { ok: false, error: 'credential_type_required' };
+  }
+  const id = String(input.id ?? '').trim();
+  const name = String(input.name ?? id).trim();
+  if (!isValidCredentialTypeId(id)) return { ok: false, error: 'invalid_credential_type_id' };
+  if (!name) return { ok: false, error: 'credential_type_name_required' };
+  if (!Array.isArray(input.fields)) return { ok: false, error: 'credential_type_fields_required' };
+  const fields = input.fields
+    .map((field) => ({
+      name: String(field?.name ?? '').trim(),
+      label: String(field?.label ?? field?.name ?? '').trim(),
+      type: ['string', 'secret', 'url', 'number', 'boolean', 'select', 'json'].includes(field?.type) ? field.type : 'string',
+      required: Boolean(field?.required),
+      default: field?.default,
+      options: Array.isArray(field?.options) ? field.options : undefined
+    }))
+    .filter((field) => field.name);
+  if (fields.length === 0) return { ok: false, error: 'credential_type_fields_required' };
+  return { ok: true, type: { id, name, fields } };
+}
+
+function isValidCredentialTypeId(id) {
+  return /^[A-Za-z][A-Za-z0-9_.-]{0,80}$/.test(String(id ?? ''));
+}
+
+function normalizeCredentialType(id, raw, skill) {
+  const fields = Array.isArray(raw?.fields)
+    ? raw.fields
+      .map((field) => ({
+        name: String(field?.name ?? '').trim(),
+        label: String(field?.label ?? field?.name ?? '').trim(),
+        type: ['string', 'secret', 'url', 'number', 'boolean', 'select', 'json'].includes(field?.type) ? field.type : 'string',
+        required: Boolean(field?.required),
+        default: field?.default,
+        options: Array.isArray(field?.options) ? field.options : undefined
+      }))
+      .filter((field) => field.name)
+    : [];
+  return {
+    id,
+    name: String(raw?.name ?? id).trim() || id,
+    skillId: skill?.id,
+    fields
+  };
+}
+
+function normalizeCredentialInputValues(inputValues, schema, existingValues = {}) {
+  const input = inputValues && typeof inputValues === 'object' && !Array.isArray(inputValues) ? inputValues : {};
+  const next = {};
+  for (const field of schema.fields ?? []) {
+    const raw = input[field.name];
+    if (field.type === 'secret') {
+      const existing = existingValues?.[field.name];
+      const value = String(raw ?? '');
+      if (value) {
+        next[field.name] = { secret: true, value };
+      } else if (existing?.secret && existing.value) {
+        next[field.name] = existing;
+      } else {
+        next[field.name] = { secret: true, value: '' };
+      }
+    } else if (field.type === 'number') {
+      const number = Number(raw ?? field.default ?? '');
+      if (Number.isFinite(number)) next[field.name] = number;
+    } else if (field.type === 'boolean') {
+      next[field.name] = raw === true || raw === 'true' || raw === 'on' || raw === 1 || raw === '1';
+    } else if (field.type === 'json') {
+      if (typeof raw === 'string') {
+        try {
+          next[field.name] = raw.trim() ? JSON.parse(raw) : field.default ?? {};
+        } catch {
+          next[field.name] = field.default ?? {};
+        }
+      } else {
+        next[field.name] = raw ?? field.default ?? {};
+      }
+    } else {
+      next[field.name] = String(raw ?? field.default ?? '').trim();
+    }
+  }
+  return next;
+}
+
+function credentialFieldValueEmpty(value) {
+  if (value && typeof value === 'object' && value.secret === true) return !value.value;
+  return value === undefined || value === null || value === '';
+}
+
+function replaceSecretsInValue(value, secrets = []) {
+  if (typeof value === 'string') return replaceSecretsInText(value, secrets);
+  if (Array.isArray(value)) return value.map((item) => replaceSecretsInValue(item, secrets));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, replaceSecretsInValue(item, secrets)]));
+  }
+  return value;
+}
+
+function replaceSecretsInText(text, secrets = []) {
+  let output = String(text ?? '');
+  for (const secret of secrets ?? []) {
+    if (!secret?.name) continue;
+    output = output.replaceAll(`\${secret:${secret.name}}`, String(secret.value ?? ''));
+  }
+  return output;
+}
+
+function redactSecretsInValue(value, secrets = []) {
+  if (typeof value === 'string') return redactSecretsInText(value, secrets);
+  if (Array.isArray(value)) return value.map((item) => redactSecretsInValue(item, secrets));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactSecretsInValue(item, secrets)]));
+  }
+  return value;
+}
+
+function redactSecretsInText(text, secrets = []) {
+  let output = String(text ?? '');
+  for (const secret of secrets ?? []) {
+    if (secret?.name) output = output.replaceAll(`\${secret:${secret.name}}`, `[secret:${secret.name}]`);
+    if (secret?.value) output = output.replaceAll(String(secret.value), `[secret:${secret.name}]`);
+  }
+  return output;
 }
 
 function normalizeMessagePageSizeInput(value) {

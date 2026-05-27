@@ -54,6 +54,12 @@ docs                  Product and engineering notes
 infra                 Deployment placeholders
 ```
 
+## Product Notes
+
+- `docs/MVP.md`: current product slice and implementation notes.
+- `docs/UI_REDESIGN.md`: UI redesign direction.
+- `docs/SKILL_EXTENSIONS.md`: Skill extension roadmap, API-backed actions, permissions, secrets, and later capability rules.
+
 ## MVP APIs
 
 - `GET /api/health`

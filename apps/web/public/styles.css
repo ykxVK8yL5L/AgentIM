@@ -1641,6 +1641,16 @@ button.inspector-section-title[type="button"]::before {
   white-space: normal;
 }
 
+.credential-choice-card {
+  border-color: rgba(15, 123, 108, 0.24);
+  background: rgba(15, 123, 108, 0.06);
+}
+
+.action-error-card {
+  border-color: rgba(176, 47, 47, 0.24);
+  background: rgba(255, 245, 245, 0.92);
+}
+
 .approval-card-header {
   display: grid;
   gap: 2px;
@@ -2865,6 +2875,21 @@ button.inspector-section-title[type="button"]::before {
   gap: 10px;
 }
 
+.skill-preview {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.skill-preview span {
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
 .category-tabs {
   display: flex;
   flex-wrap: wrap;
@@ -3770,4 +3795,91 @@ body.auth-locked {
   padding-bottom: 16px;
   margin-bottom: 16px;
   border-bottom: 1px solid #e5e9f0;
+}
+
+.inline-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 36px;
+  gap: 8px;
+  align-items: center;
+}
+
+.icon-button {
+  width: 36px;
+  min-width: 36px;
+  height: 36px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(15, 23, 42, 0.38);
+}
+
+.modal-overlay[hidden] {
+  display: none;
+}
+
+.modal-card {
+  width: min(760px, 100%);
+  max-height: min(760px, calc(100vh - 40px));
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: grid;
+  gap: 14px;
+  padding: 20px;
+  border: 1px solid #d8e0e8;
+  border-radius: 10px;
+  background: #ffffff;
+  box-shadow: 0 24px 80px rgba(22, 34, 51, 0.22);
+}
+
+.modal-heading,
+.modal-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.modal-heading h2,
+.modal-heading h3 {
+  margin: 0;
+}
+
+.modal-heading.compact {
+  margin-top: 4px;
+}
+
+.modal-actions {
+  justify-content: flex-end;
+}
+
+.credential-field-list {
+  display: grid;
+  gap: 10px;
+}
+
+.credential-field-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 8px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid #e5e9f0;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.credential-field-row .danger-button {
+  justify-self: start;
 }

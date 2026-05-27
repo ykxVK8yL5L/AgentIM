@@ -9,6 +9,19 @@ const state = {
       proxyUrl: '',
       providerTimeoutMs: 300000
     },
+    apiRequest: {
+      enabled: true,
+      allowlistEnabled: false,
+      allowedHosts: [],
+      allowHttp: true,
+      allowLocalhost: true,
+      allowPrivateNetwork: true,
+      timeoutMs: 30000,
+      maxResponseBytes: 512000
+    },
+    secrets: [],
+    credentials: [],
+    customCredentialTypes: [],
     chat: {
       messagePageSize: 20
     },
@@ -36,6 +49,7 @@ const state = {
   skillInvocations: [],
   skillApprovals: [],
   artifacts: [],
+  runtime: null,
   workspace: null,
   workspaceFiles: [],
   workspacePath: '',
@@ -46,6 +60,8 @@ const state = {
   messages: [],
   activeRoomId: null,
   editingProviderId: null,
+  providerProbeRequestId: 0,
+  editingCredentialId: null,
   editingRoleId: null,
   editingSkillId: null,
   editingAgentId: null,
@@ -132,6 +148,7 @@ const els = {
   authError: document.querySelector('#auth-error'),
   passwordReminder: document.querySelector('#password-reminder'),
   passwordWarning: document.querySelector('#password-warning'),
+  runtimeInfo: document.querySelector('#runtime-info'),
   passwordForm: document.querySelector('#password-form'),
   conversationFilters: document.querySelectorAll('[data-conversation-filter]'),
   conversationSearch: document.querySelector('#conversation-search'),
@@ -141,6 +158,22 @@ const els = {
   roomSubmit: document.querySelector('#room-submit'),
   roomCancel: document.querySelector('#room-cancel'),
   settingsForm: document.querySelector('#settings-form'),
+  chatSettingsForm: document.querySelector('#chat-settings-form'),
+  trustedApprovalCount: document.querySelector('#trusted-approval-count'),
+  trustedApprovalList: document.querySelector('#trusted-approval-list'),
+  secretForm: document.querySelector('#secret-form'),
+  secretSave: document.querySelector('#secret-save'),
+  secretCancel: document.querySelector('#secret-cancel'),
+  secretCount: document.querySelector('#secret-count'),
+  secretList: document.querySelector('#secret-list'),
+  credentialTypeOpen: document.querySelector('#credential-type-open'),
+  credentialTypeModal: document.querySelector('#credential-type-modal'),
+  credentialTypeForm: document.querySelector('#credential-type-form'),
+  credentialTypeClose: document.querySelector('#credential-type-close'),
+  credentialTypeCancel: document.querySelector('#credential-type-cancel'),
+  credentialFieldAdd: document.querySelector('#credential-field-add'),
+  credentialFieldList: document.querySelector('#credential-field-list'),
+  credentialTypeList: document.querySelector('#credential-type-list'),
   roomCount: document.querySelector('#room-count'),
   roomCountCopy: document.querySelector('#room-count-copy'),
   conversationList: document.querySelector('#conversation-list'),
@@ -167,6 +200,8 @@ const els = {
   skillList: document.querySelector('#skill-list'),
   skillCount: document.querySelector('#skill-count'),
   skillSubmit: document.querySelector('#skill-submit'),
+  skillValidate: document.querySelector('#skill-validate'),
+  skillPreview: document.querySelector('#skill-preview'),
   skillCancel: document.querySelector('#skill-cancel'),
   skillCategoryTabs: document.querySelector('#skill-category-tabs'),
   agentForm: document.querySelector('#agent-form'),
@@ -382,7 +417,7 @@ els.scrollLatest?.addEventListener('click', () => {
 
 els.passwordReminder?.addEventListener('click', () => {
   activateAppSection('settings');
-  activateSectionTab('settings:network');
+  activateSectionTab('settings:system');
   els.passwordForm?.elements.password?.focus();
 });
 
@@ -472,6 +507,34 @@ els.settingsForm.addEventListener('submit', async (event) => {
         proxyUrl: data.proxyUrl,
         providerTimeoutMs: Number(data.providerTimeoutMs)
       },
+      apiRequest: {
+        enabled: data.apiRequestEnabled === 'on',
+        allowlistEnabled: data.apiRequestAllowlistEnabled === 'on',
+        allowedHosts: String(data.apiRequestAllowedHosts ?? '').split(/[\n,]/).map((item) => item.trim()).filter(Boolean),
+        allowHttp: data.apiRequestAllowHttp === 'on',
+        allowLocalhost: data.apiRequestAllowLocalhost === 'on',
+        allowPrivateNetwork: data.apiRequestAllowPrivateNetwork === 'on',
+        timeoutMs: Number(data.apiRequestTimeoutMs),
+        maxResponseBytes: Number(data.apiRequestMaxResponseBytes)
+      }
+    }
+  });
+  state.settings = settings;
+  state.messagePageSize = settings.chat?.messagePageSize ?? 20;
+  renderSettings();
+  if (state.activeRoomId) {
+    await loadLatestMessages();
+    renderMessages();
+  }
+  alert('Global settings saved.');
+});
+
+els.chatSettingsForm?.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const data = formData(els.chatSettingsForm);
+  const settings = await api('/api/settings', {
+    method: 'PATCH',
+    body: {
       chat: {
         messagePageSize: Number(data.messagePageSize)
       },
@@ -487,31 +550,108 @@ els.settingsForm.addEventListener('submit', async (event) => {
     await loadLatestMessages();
     renderMessages();
   }
-  alert('Global settings saved.');
+  alert('Chat settings saved.');
+});
+
+els.secretSave?.addEventListener('click', async () => {
+  const type = String(els.secretForm?.querySelector('[name="type"]')?.value ?? '').trim();
+  const nameInput = els.secretForm?.querySelector('[name="name"]');
+  const name = String(nameInput?.value ?? '').trim();
+  const schema = credentialTypeOptions().find((item) => item.id === type);
+  if (!type || !schema || !name) {
+    alert('Credential type and name are required.');
+    return;
+  }
+  const values = {};
+  for (const field of schema.fields ?? []) {
+    const input = els.secretForm?.querySelector(`[name="field:${CSS.escape(field.name)}"]`);
+    if (!input) continue;
+    values[field.name] = input.type === 'checkbox' ? input.checked : input.value;
+  }
+  const result = await api('/api/settings/credentials', {
+    method: 'POST',
+    body: { id: state.editingCredentialId, type, name, values }
+  });
+  state.settings.credentials = result.credentials ?? [];
+  resetCredentialForm();
+  renderSettings();
+});
+
+els.secretCancel?.addEventListener('click', () => {
+  resetCredentialForm();
+  renderSettings();
+});
+
+els.credentialTypeOpen?.addEventListener('click', () => openCredentialTypeModal());
+els.credentialTypeClose?.addEventListener('click', closeCredentialTypeModal);
+els.credentialTypeCancel?.addEventListener('click', closeCredentialTypeModal);
+els.credentialFieldAdd?.addEventListener('click', () => addCredentialFieldRow());
+els.credentialTypeForm?.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const manifest = credentialTypeManifestFromForm();
+  if (!manifest.id || !manifest.name || manifest.fields.length === 0) {
+    alert('Credential type id, name, and at least one field are required.');
+    return;
+  }
+  const result = await api('/api/settings/credential-types', {
+    method: 'POST',
+    body: manifest
+  });
+  state.settings.customCredentialTypes = result.customCredentialTypes ?? [];
+  closeCredentialTypeModal();
+  renderSettings();
+});
+
+els.secretForm?.querySelector('[name="typeFilter"]')?.addEventListener('input', () => {
+  renderCredentialTypeSelect();
+  renderCredentialFields();
 });
 
 els.probeButton.addEventListener('click', async () => {
+  const requestId = state.providerProbeRequestId + 1;
+  state.providerProbeRequestId = requestId;
   const data = formData(els.providerForm);
+  if (state.editingProviderId && !String(data.apiKey ?? '').trim()) {
+    data.providerId = state.editingProviderId;
+  }
   els.probeResult.style.display = 'block';
   els.probeResult.textContent = 'Probing...';
+  els.probeButton.disabled = true;
+  els.probeButton.textContent = 'Probing';
 
-  if (data.baseUrl === 'mock://provider') {
+  try {
+    if (data.baseUrl === 'mock://provider') {
+      if (requestId !== state.providerProbeRequestId) return;
+      els.probeResult.textContent = JSON.stringify({
+        ok: true,
+        protocol: 'mock',
+        models: [{ id: data.defaultModel, name: data.defaultModel }]
+      }, null, 2);
+      return;
+    }
+
+    const result = await api('/api/model-providers/probe', {
+      method: 'POST',
+      body: data
+    });
+    if (requestId !== state.providerProbeRequestId) return;
+    els.probeResult.textContent = JSON.stringify(result, null, 2);
+
+    if (result.ok && result.models?.[0]) {
+      els.providerForm.elements.defaultModel.value = result.models[0].id;
+    }
+  } catch (error) {
+    if (requestId !== state.providerProbeRequestId) return;
     els.probeResult.textContent = JSON.stringify({
-      ok: true,
-      protocol: 'mock',
-      models: [{ id: data.defaultModel, name: data.defaultModel }]
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+      details: error?.data ?? null
     }, null, 2);
-    return;
-  }
-
-  const result = await api('/api/model-providers/probe', {
-    method: 'POST',
-    body: data
-  });
-  els.probeResult.textContent = JSON.stringify(result, null, 2);
-
-  if (result.ok && result.models?.[0]) {
-    els.providerForm.elements.defaultModel.value = result.models[0].id;
+  } finally {
+    if (requestId === state.providerProbeRequestId) {
+      els.probeButton.disabled = false;
+      els.probeButton.textContent = 'Probe';
+    }
   }
 });
 
@@ -573,6 +713,12 @@ els.skillForm.addEventListener('submit', async (event) => {
     alert('Skill manifest must be valid JSON.');
     return;
   }
+  const preview = previewSkillManifest(manifest);
+  renderSkillPreview(preview);
+  if (!preview.ok) return;
+  if (skillManifestNeedsInstallConfirmation(manifest) && !confirm(`Install "${manifest.name ?? manifest.id}" with network or elevated permissions?`)) {
+    return;
+  }
   try {
     const saved = await api('/api/skills/install', {
       method: 'POST',
@@ -584,6 +730,17 @@ els.skillForm.addEventListener('submit', async (event) => {
   } catch (error) {
     alert(`Skill install failed: ${error instanceof Error ? error.message : String(error)}`);
   }
+});
+
+els.skillValidate?.addEventListener('click', () => {
+  let manifest;
+  try {
+    manifest = JSON.parse(els.skillForm.elements.manifest.value);
+  } catch {
+    renderSkillPreview({ ok: false, errors: ['Manifest must be valid JSON.'], summary: [] });
+    return;
+  }
+  renderSkillPreview(previewSkillManifest(manifest));
 });
 
 els.skillCancel.addEventListener('click', resetSkillForm);
@@ -812,7 +969,8 @@ async function init(options = {}) {
   restoreMentionState();
   try {
     const health = await api('/api/health');
-    setApiStatus(health.ok ? `Online · ${health.store?.kind ?? 'store'}` : 'Degraded');
+    state.runtime = health.runtime ?? state.runtime;
+    setApiStatus(health.ok ? onlineStatusLabel() : 'Degraded');
   } catch (error) {
     setApiStatus('Offline');
     console.error(error);
@@ -837,6 +995,7 @@ async function init(options = {}) {
 
   try {
     const boot = await api('/api/bootstrap');
+    updateRuntimeInfo(boot.runtime);
     state.settings = boot.settings ?? state.settings;
     state.providers = boot.providers ?? [];
     state.agents = boot.agents ?? [];
@@ -920,6 +1079,7 @@ function renderAll() {
   renderReplyPreview();
   renderWorkspace();
   renderSkillInvocations();
+  renderTrustedApprovals();
   renderArtifacts();
 }
 
@@ -963,8 +1123,396 @@ function renderSettings() {
   els.settingsForm.elements.proxyEnabled.checked = Boolean(state.settings?.network?.proxyEnabled);
   els.settingsForm.elements.proxyUrl.value = state.settings?.network?.proxyUrl ?? '';
   els.settingsForm.elements.providerTimeoutMs.value = state.settings?.network?.providerTimeoutMs ?? 300000;
-  els.settingsForm.elements.messagePageSize.value = state.settings?.chat?.messagePageSize ?? 20;
-  els.settingsForm.elements.approvalMode.value = state.settings?.approvals?.mode ?? 'auto';
+  const apiRequest = state.settings?.apiRequest ?? {};
+  els.settingsForm.elements.apiRequestEnabled.checked = apiRequest.enabled !== false;
+  els.settingsForm.elements.apiRequestAllowlistEnabled.checked = Boolean(apiRequest.allowlistEnabled);
+  els.settingsForm.elements.apiRequestAllowedHosts.value = (apiRequest.allowedHosts ?? []).join('\n');
+  els.settingsForm.elements.apiRequestAllowHttp.checked = apiRequest.allowHttp !== false;
+  els.settingsForm.elements.apiRequestAllowLocalhost.checked = apiRequest.allowLocalhost !== false;
+  els.settingsForm.elements.apiRequestAllowPrivateNetwork.checked = apiRequest.allowPrivateNetwork !== false;
+  els.settingsForm.elements.apiRequestTimeoutMs.value = apiRequest.timeoutMs ?? 30000;
+  els.settingsForm.elements.apiRequestMaxResponseBytes.value = apiRequest.maxResponseBytes ?? 512000;
+  if (els.chatSettingsForm) {
+    els.chatSettingsForm.elements.messagePageSize.value = state.settings?.chat?.messagePageSize ?? 20;
+    els.chatSettingsForm.elements.approvalMode.value = state.settings?.approvals?.mode ?? 'auto';
+  }
+  renderRuntimeInfo();
+  renderTrustedApprovals();
+  renderSecrets();
+}
+
+function renderSecrets() {
+  if (!els.secretList) return;
+  renderCredentialTypeSelect();
+  renderCredentialFields();
+  const credentials = state.settings?.credentials ?? [];
+  if (els.secretCount) els.secretCount.textContent = String(credentials.length);
+  els.secretList.innerHTML = credentials.length > 0
+    ? credentialGroups(credentials).map(({ type, typeName, credentials: groupCredentials }) => `
+      <section class="skill-category-group">
+        <div class="skill-category-heading">
+          <strong>${escapeHtml(typeName)}</strong>
+          <span>${escapeHtml(type)} · ${groupCredentials.length}</span>
+        </div>
+        <div class="skill-category-list">
+          ${groupCredentials.map((credential) => `
+            <div class="entity-item">
+              <div class="entity-main">
+                <strong>${escapeHtml(credential.name)}</strong>
+                <span>${escapeHtml(credential.type)}</span>
+                <span>${escapeHtml(credentialFieldSummary(credential))}</span>
+              </div>
+              <div class="entity-actions">
+                <button type="button" data-test-credential="${escapeHtml(credential.id)}">Test</button>
+                <button type="button" data-edit-credential="${escapeHtml(credential.id)}">Edit</button>
+                <button type="button" class="danger-button" data-delete-credential="${escapeHtml(credential.id)}">Delete</button>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      </section>
+    `).join('')
+    : '<div class="muted-empty">No credentials saved.</div>';
+  for (const item of els.secretList.querySelectorAll('[data-test-credential]')) {
+    item.addEventListener('click', async () => {
+      await testCredential(item.getAttribute('data-test-credential'));
+    });
+  }
+  for (const item of els.secretList.querySelectorAll('[data-edit-credential]')) {
+    item.addEventListener('click', () => {
+      const id = item.getAttribute('data-edit-credential');
+      const credential = credentials.find((entry) => entry.id === id);
+      if (credential) startCredentialEdit(credential);
+    });
+  }
+  for (const item of els.secretList.querySelectorAll('[data-delete-credential]')) {
+    item.addEventListener('click', async () => {
+      const id = item.getAttribute('data-delete-credential');
+      if (!confirm('Delete credential?')) return;
+      const result = await api(`/api/settings/credentials/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      state.settings.credentials = result.credentials ?? [];
+      renderSettings();
+    });
+  }
+  renderCredentialTypeList();
+}
+
+function credentialGroups(credentials) {
+  const types = new Map(credentialTypeOptions().map((type) => [type.id, type]));
+  const groups = new Map();
+  for (const credential of credentials) {
+    const type = credential.type || 'unknown';
+    if (!groups.has(type)) {
+      groups.set(type, {
+        type,
+        typeName: types.get(type)?.name ?? type,
+        credentials: []
+      });
+    }
+    groups.get(type).credentials.push(credential);
+  }
+  return [...groups.values()]
+    .map((group) => ({
+      ...group,
+      credentials: group.credentials.sort((a, b) => String(a.name).localeCompare(String(b.name)))
+    }))
+    .sort((a, b) => a.typeName.localeCompare(b.typeName));
+}
+
+async function testCredential(id) {
+  if (!id) return;
+  try {
+    const result = await api(`/api/settings/credentials/${encodeURIComponent(id)}/test`, { method: 'POST' });
+    alert(formatCredentialTestResult(result));
+  } catch (error) {
+    const result = error?.data;
+    if (result?.checks) {
+      alert(formatCredentialTestResult(result));
+      return;
+    }
+    alert(`Credential test failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function formatCredentialTestResult(result) {
+  const lines = [
+    result.ok ? 'Credential test passed.' : 'Credential test failed.',
+    ...(result.checks ?? []).map((check) => `${check.status}: ${check.name} - ${check.message}`)
+  ];
+  return lines.join('\n');
+}
+
+function renderTrustedApprovals() {
+  if (!els.trustedApprovalList) return;
+  const trusted = trustedApprovalsForActiveRoom();
+  if (els.trustedApprovalCount) els.trustedApprovalCount.textContent = String(trusted.length);
+  els.trustedApprovalList.innerHTML = trusted.length > 0
+    ? trusted.map((approval) => `
+      <div class="entity-item">
+        <div class="entity-main">
+          <strong>${escapeHtml(approval.title ?? approval.skillId)}</strong>
+          <span>${escapeHtml(trustedApprovalSummary(approval))}</span>
+          <span>${escapeHtml(approval.decidedAt ? `Trusted ${new Date(approval.decidedAt).toLocaleString()}` : 'Trusted')}</span>
+        </div>
+        <div class="entity-actions">
+          <button type="button" class="danger-button" data-revoke-approval-trust="${escapeHtml(approval.id)}">Revoke</button>
+        </div>
+      </div>
+    `).join('')
+    : '<div class="muted-empty">No chat-level approval trusts.</div>';
+  for (const item of els.trustedApprovalList.querySelectorAll('[data-revoke-approval-trust]')) {
+    item.addEventListener('click', async () => {
+      const id = item.getAttribute('data-revoke-approval-trust');
+      if (!confirm('Revoke this chat trust?')) return;
+      const result = await api(`/api/skill-approvals/${encodeURIComponent(id)}/revoke-trust`, { method: 'POST' });
+      if (result.approval) replaceByIdOrPush(state.skillApprovals, result.approval);
+      await refreshSkillApprovals();
+      renderTrustedApprovals();
+      renderSkillInvocations();
+    });
+  }
+}
+
+function trustedApprovalsForActiveRoom() {
+  return (state.skillApprovals ?? [])
+    .filter((approval) =>
+      approval.roomId === state.activeRoomId &&
+      approval.status === 'approved' &&
+      approval.input?.kind === 'skill_action' &&
+      approval.input?.trustScope === 'room'
+    )
+    .sort((a, b) => String(b.decidedAt ?? b.updatedAt ?? b.createdAt ?? '').localeCompare(String(a.decidedAt ?? a.updatedAt ?? a.createdAt ?? '')));
+}
+
+function trustedApprovalSummary(approval) {
+  const input = approval.input ?? {};
+  return [
+    input.skillId ?? approval.skillId,
+    input.actionId,
+    input.credentialName ? `credential: ${input.credentialName}` : ''
+  ].filter(Boolean).join(' · ');
+}
+
+function renderCredentialTypeSelect() {
+  const typeSelect = els.secretForm?.querySelector('[name="type"]');
+  if (!typeSelect) return;
+  const types = filteredCredentialTypeOptions();
+  const current = typeSelect.value || types[0]?.id || '';
+  typeSelect.innerHTML = types.length > 0
+    ? types.map((type) => `<option value="${escapeHtml(type.id)}">${escapeHtml(type.name)} · ${escapeHtml(type.id)}</option>`).join('')
+    : '<option value="">No matching credential types</option>';
+  typeSelect.value = types.some((type) => type.id === current) ? current : types[0]?.id ?? '';
+  typeSelect.onchange = renderCredentialFields;
+}
+
+function credentialTypeOptions() {
+  const byId = new Map();
+  for (const skill of state.skills ?? []) {
+    const types = skill.credentialTypes && typeof skill.credentialTypes === 'object' ? skill.credentialTypes : {};
+    for (const [id, type] of Object.entries(types)) {
+      if (!byId.has(id)) byId.set(id, { id, name: type.name ?? id, fields: type.fields ?? [], skillId: skill.id });
+    }
+  }
+  for (const type of state.settings?.customCredentialTypes ?? []) {
+    byId.set(type.id, { id: type.id, name: type.name ?? type.id, fields: type.fields ?? [], source: 'user' });
+  }
+  return [...byId.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function filteredCredentialTypeOptions() {
+  const query = String(els.secretForm?.querySelector('[name="typeFilter"]')?.value ?? '').trim().toLowerCase();
+  const types = credentialTypeOptions();
+  if (!query) return types;
+  return types.filter((type) => {
+    const fields = (type.fields ?? []).map((field) => `${field.name} ${field.label ?? ''} ${field.type ?? ''}`).join(' ');
+    return `${type.id} ${type.name} ${fields}`.toLowerCase().includes(query);
+  });
+}
+
+function renderCredentialTypeList() {
+  if (!els.credentialTypeList) return;
+  const types = state.settings?.customCredentialTypes ?? [];
+  els.credentialTypeList.innerHTML = types.length > 0
+    ? types.map((type) => `
+      <div class="entity-item">
+        <div class="entity-main">
+          <strong>${escapeHtml(type.name)}</strong>
+          <span>${(type.fields ?? []).map((field) => `${field.name}:${field.type}`).join(', ')}</span>
+        </div>
+        <div class="entity-actions">
+          <button type="button" data-edit-credential-type="${escapeHtml(type.id)}">Edit</button>
+          <button type="button" class="danger-button" data-delete-credential-type="${escapeHtml(type.id)}">Delete</button>
+        </div>
+      </div>
+    `).join('')
+    : '<div class="muted-empty">No custom credential types.</div>';
+  for (const item of els.credentialTypeList.querySelectorAll('[data-edit-credential-type]')) {
+    item.addEventListener('click', () => {
+      const type = types.find((entry) => entry.id === item.getAttribute('data-edit-credential-type'));
+      if (type) openCredentialTypeModal(type);
+    });
+  }
+  for (const item of els.credentialTypeList.querySelectorAll('[data-delete-credential-type]')) {
+    item.addEventListener('click', async () => {
+      const id = item.getAttribute('data-delete-credential-type');
+      if (!confirm(`Delete credential type "${id}"?`)) return;
+      const result = await api(`/api/settings/credential-types/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      state.settings.customCredentialTypes = result.customCredentialTypes ?? [];
+      renderSettings();
+    });
+  }
+}
+
+function openCredentialTypeModal(type = null) {
+  if (!els.credentialTypeModal || !els.credentialTypeForm) return;
+  els.credentialTypeForm.reset();
+  els.credentialTypeForm.dataset.editingId = type?.id ?? '';
+  els.credentialTypeForm.elements.name.value = type?.name ?? '';
+  els.credentialFieldList.innerHTML = '';
+  const fields = type?.fields?.length
+    ? type.fields
+    : [
+      { name: 'base_url', label: 'Base URL', type: 'url', required: true },
+      { name: 'api_key', label: 'API Key', type: 'secret', required: true }
+    ];
+  for (const field of fields) addCredentialFieldRow(field);
+  els.credentialTypeModal.hidden = false;
+  els.credentialTypeForm.elements.name.focus();
+}
+
+function closeCredentialTypeModal() {
+  if (els.credentialTypeModal) els.credentialTypeModal.hidden = true;
+}
+
+function credentialTypeIdFromName(value) {
+  const words = String(value ?? '')
+    .trim()
+    .replace(/[^a-zA-Z0-9]+/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+  if (words.length === 0) return '';
+  const [first, ...rest] = words;
+  return [
+    first.charAt(0).toLowerCase() + first.slice(1),
+    ...rest.map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+  ].join('').replace(/^[^A-Za-z]+/, '');
+}
+
+function addCredentialFieldRow(field = {}) {
+  if (!els.credentialFieldList) return;
+  const row = document.createElement('div');
+  row.className = 'credential-field-row';
+  row.innerHTML = `
+    <input name="fieldName" placeholder="field_name" value="${escapeHtml(field.name ?? '')}" />
+    <input name="fieldLabel" placeholder="Label" value="${escapeHtml(field.label ?? '')}" />
+    <select name="fieldType">
+      ${['string', 'secret', 'url', 'number', 'boolean', 'select', 'json'].map((type) => `<option value="${type}" ${field.type === type ? 'selected' : ''}>${type}</option>`).join('')}
+    </select>
+    <label class="checkbox-label"><input type="checkbox" name="fieldRequired" ${field.required ? 'checked' : ''} /> Required</label>
+    <input name="fieldDefault" placeholder="Default" value="${escapeHtml(field.default ?? '')}" />
+    <button type="button" class="danger-button" data-remove-field>Remove</button>
+  `;
+  row.querySelector('[data-remove-field]')?.addEventListener('click', () => row.remove());
+  els.credentialFieldList.appendChild(row);
+}
+
+function credentialTypeManifestFromForm() {
+  const fields = [...(els.credentialFieldList?.querySelectorAll('.credential-field-row') ?? [])]
+    .map((row) => ({
+      name: String(row.querySelector('[name="fieldName"]')?.value ?? '').trim(),
+      label: String(row.querySelector('[name="fieldLabel"]')?.value ?? '').trim(),
+      type: String(row.querySelector('[name="fieldType"]')?.value ?? 'string').trim(),
+      required: Boolean(row.querySelector('[name="fieldRequired"]')?.checked),
+      default: String(row.querySelector('[name="fieldDefault"]')?.value ?? '').trim()
+    }))
+    .filter((field) => field.name);
+  return {
+    id: els.credentialTypeForm?.dataset.editingId || generatedCredentialTypeId(els.credentialTypeForm?.elements.name.value),
+    name: String(els.credentialTypeForm?.elements.name.value ?? '').trim(),
+    fields: fields.map((field) => field.default ? field : (({ default: _default, ...rest }) => rest)(field))
+  };
+}
+
+function generatedCredentialTypeId(name) {
+  const base = credentialTypeIdFromName(name) || 'credentialType';
+  const suffix = Math.random().toString(36).slice(2, 8);
+  return `${base}_${suffix}`;
+}
+
+function renderCredentialFields() {
+  const root = document.querySelector('#credential-fields');
+  const typeId = els.secretForm?.querySelector('[name="type"]')?.value;
+  if (!root) return;
+  const schema = credentialTypeOptions().find((item) => item.id === typeId);
+  root.innerHTML = schema
+    ? (schema.fields ?? []).map(renderCredentialField).join('')
+    : '<div class="muted-empty">No credential types are available from installed skills.</div>';
+}
+
+function renderCredentialField(field) {
+  const required = field.required ? ' required' : '';
+  const name = `field:${field.name}`;
+  if (field.type === 'boolean') {
+    return `<label class="checkbox-label"><input type="checkbox" name="${escapeHtml(name)}" /> ${escapeHtml(field.label ?? field.name)}</label>`;
+  }
+  if (field.type === 'select') {
+    const options = Array.isArray(field.options) ? field.options : [];
+    return `<label>${escapeHtml(field.label ?? field.name)}<select name="${escapeHtml(name)}">${options.map((option) => `<option value="${escapeHtml(option)}" ${String(field.default ?? '') === String(option) ? 'selected' : ''}>${escapeHtml(option || 'None')}</option>`).join('')}</select></label>`;
+  }
+  const type = field.type === 'secret' ? 'password' : field.type === 'number' ? 'number' : field.type === 'url' ? 'url' : 'text';
+  return `<label>${escapeHtml(field.label ?? field.name)}<input name="${escapeHtml(name)}" type="${type}" value="${escapeHtml(field.default ?? '')}" ${required} /></label>`;
+}
+
+function credentialFieldSummary(credential) {
+  const values = credential.values ?? {};
+  return Object.entries(values)
+    .map(([key, value]) => value?.secret ? `${key}: stored` : `${key}: ${String(value).slice(0, 48)}`)
+    .join(' · ');
+}
+
+function startCredentialEdit(credential) {
+  state.editingCredentialId = credential.id;
+  const typeSelect = els.secretForm?.querySelector('[name="type"]');
+  const filter = els.secretForm?.querySelector('[name="typeFilter"]');
+  if (filter) filter.value = '';
+  renderCredentialTypeSelect();
+  if (typeSelect) typeSelect.value = credential.type;
+  els.secretForm.querySelector('[name="name"]').value = credential.name ?? '';
+  renderCredentialFields();
+  populateCredentialFields(credential);
+  if (els.secretSave) els.secretSave.textContent = 'Update Credential';
+  if (els.secretCancel) els.secretCancel.hidden = false;
+  els.secretForm.scrollIntoView({ block: 'nearest' });
+}
+
+function populateCredentialFields(credential) {
+  const values = credential.values ?? {};
+  for (const [key, value] of Object.entries(values)) {
+    const input = els.secretForm?.querySelector(`[name="field:${CSS.escape(key)}"]`);
+    if (!input) continue;
+    if (input.type === 'checkbox') {
+      input.checked = Boolean(value);
+    } else if (value?.secret) {
+      input.value = '';
+      input.placeholder = value.hasValue ? 'Stored. Leave blank to keep.' : '';
+    } else if (typeof value === 'object') {
+      input.value = JSON.stringify(value, null, 2);
+    } else {
+      input.value = value ?? '';
+    }
+  }
+}
+
+function resetCredentialForm() {
+  state.editingCredentialId = null;
+  const nameInput = els.secretForm?.querySelector('[name="name"]');
+  if (nameInput) nameInput.value = '';
+  for (const input of els.secretForm?.querySelectorAll('[name^="field:"]') ?? []) {
+    if (input.type === 'checkbox') input.checked = false;
+    else input.value = '';
+  }
+  if (els.secretSave) els.secretSave.textContent = 'Save Credential';
+  if (els.secretCancel) els.secretCancel.hidden = true;
 }
 
 function showAuthGate(show) {
@@ -1492,11 +2040,12 @@ function conversationSubtitle(room) {
 async function openAgentConversation(agentId) {
   const agent = state.agents.find((item) => item.id === agentId);
   if (!agent) return;
-  const existingRoom = state.rooms.find((room) =>
-    room.type === 'dm' &&
-    (room.dmAgentId === agentId ||
-      state.roomAgents.some((join) => join.roomId === room.id && join.agentId === agentId && join.enabled !== false))
-  );
+  const existingRoom = state.rooms.find((room) => room.type === 'dm' && room.dmAgentId === agentId)
+    ?? state.rooms.find((room) => {
+      if (room.type !== 'dm' || room.dmAgentId) return false;
+      const members = state.roomAgents.filter((join) => join.roomId === room.id && join.enabled !== false);
+      return members.length === 1 && members[0].agentId === agentId;
+    });
   let room = existingRoom;
   if (!room) {
     room = await api('/api/rooms', {
@@ -1517,18 +2066,35 @@ async function openAgentConversation(agentId) {
       }
     });
     await refreshRoomAgents();
-  } else if (room.dmAgentId !== agent.id) {
-    room = await api(`/api/rooms/${room.id}`, {
-      method: 'PATCH',
-      body: {
-        name: room.name,
-        type: 'dm',
-        description: room.description ?? `Direct chat with ${agent.name}`,
-        dmAgentId: agent.id
-      }
-    });
-    const roomIndex = state.rooms.findIndex((item) => item.id === room.id);
-    if (roomIndex >= 0) state.rooms[roomIndex] = room;
+  } else {
+    if (room.dmAgentId !== agent.id) {
+      room = await api(`/api/rooms/${room.id}`, {
+        method: 'PATCH',
+        body: {
+          name: room.name,
+          type: 'dm',
+          description: room.description ?? `Direct chat with ${agent.name}`,
+          dmAgentId: agent.id
+        }
+      });
+      const roomIndex = state.rooms.findIndex((item) => item.id === room.id);
+      if (roomIndex >= 0) state.rooms[roomIndex] = room;
+    }
+    const hasMembership = state.roomAgents.some((join) =>
+      join.roomId === room.id &&
+      join.agentId === agent.id &&
+      join.enabled !== false
+    );
+    if (!hasMembership) {
+      await api(`/api/rooms/${room.id}/agents`, {
+        method: 'POST',
+        body: {
+          agentId: agent.id,
+          triggerMode: 'manual'
+        }
+      });
+      await refreshRoomAgents();
+    }
   }
   setActiveRoomId(room.id);
   resetPreview();
@@ -1623,6 +2189,8 @@ function renderRoles() {
             <strong>${escapeHtml(role.name)}${role.system ? ' · System' : ''}</strong>
             <span>${escapeHtml(role.description || 'No description')}</span>
             <span>${usedBy} agent${usedBy === 1 ? '' : 's'} · ${escapeHtml(roleSkills)}</span>
+            <span>${escapeHtml(roleSkillPreview(role))}</span>
+            <span>${escapeHtml(roleRiskSummary(role))}</span>
           </div>
           <div class="entity-actions">
             <button type="button" data-edit-role="${escapeHtml(role.id)}">Edit</button>
@@ -1635,19 +2203,7 @@ function renderRoles() {
 
   for (const item of els.roleList.querySelectorAll('[data-edit-role]')) {
     item.addEventListener('click', () => {
-      const role = state.roles.find((entry) => entry.id === item.getAttribute('data-edit-role'));
-      if (!role) return;
-      state.editingRoleId = role.id;
-      els.roleForm.elements.name.value = role.name;
-      els.roleForm.elements.description.value = role.description ?? '';
-      els.roleForm.elements.systemPrompt.value = role.systemPrompt ?? '';
-      renderRoleSkillOptions();
-      setSelectedRoleSkillIds(role.skillIds ?? []);
-      els.roleSubmit.textContent = role.system ? 'Update System Role' : 'Update Role';
-      els.roleCancel.hidden = false;
-      activateAppSection('settings');
-      activateSectionTab('settings:roles');
-      els.roleForm.elements.name.focus();
+      openRoleEditor(item.getAttribute('data-edit-role'));
     });
   }
 
@@ -1663,6 +2219,22 @@ function renderRoles() {
       renderAll();
     });
   }
+}
+
+function openRoleEditor(roleId) {
+  const role = state.roles.find((entry) => entry.id === roleId);
+  if (!role) return;
+  state.editingRoleId = role.id;
+  els.roleForm.elements.name.value = role.name;
+  els.roleForm.elements.description.value = role.description ?? '';
+  els.roleForm.elements.systemPrompt.value = role.systemPrompt ?? '';
+  renderRoleSkillOptions();
+  setSelectedRoleSkillIds(role.skillIds ?? []);
+  els.roleSubmit.textContent = role.system ? 'Update System Role' : 'Update Role';
+  els.roleCancel.hidden = false;
+  activateAppSection('settings');
+  activateSectionTab('settings:roles');
+  els.roleForm.elements.name.focus();
 }
 
 function renderRoleSkillOptions() {
@@ -1695,6 +2267,30 @@ function roleSkillSummary(role) {
   const ids = Array.isArray(role?.skillIds) ? role.skillIds : [];
   if (ids.length === 0) return '0 executable skills';
   return `${effectiveRoleSkillIds(role).length} executable skills`;
+}
+
+function roleSkillPreview(role, limit = 6) {
+  const skills = skillsForRole(role);
+  if (skills.length === 0) return 'No enabled skills';
+  const visible = skills.slice(0, limit).map((skill) => skill.id).join(', ');
+  return skills.length > limit ? `${visible}, +${skills.length - limit} more` : visible;
+}
+
+function roleRiskSummary(role) {
+  const skills = skillsForRole(role);
+  const high = skills.filter((skill) => String(skill.riskLevel ?? '').toLowerCase() === 'high' || skill.requiresApproval).length;
+  const external = skills.filter((skill) => skill.policy?.externalEffect).length;
+  const credentials = skills.filter((skill) => Array.isArray(skill.credentials) && skill.credentials.length > 0).length;
+  return [
+    high ? `${high} approval-aware` : '',
+    external ? `${external} external effect` : '',
+    credentials ? `${credentials} credential-backed` : ''
+  ].filter(Boolean).join(' · ') || 'Low-risk only';
+}
+
+function skillsForRole(role) {
+  const ids = new Set(effectiveRoleSkillIds(role));
+  return state.skills.filter((skill) => ids.has(skill.id));
 }
 
 function renderSkills() {
@@ -1810,12 +2406,17 @@ function renderSkillItem(skill) {
   const runtime = skill.runtime?.kind
     ? `${skill.runtime.kind}${skill.runtime.adapter ? `:${skill.runtime.adapter}` : ''}`
     : 'runtime: unknown';
+  const actionCount = Array.isArray(skill.actions) ? skill.actions.length : 0;
+  const hosts = Array.isArray(skill.permissions?.network?.hosts)
+    ? skill.permissions.network.hosts.filter(Boolean).slice(0, 3)
+    : [];
   return `
     <div class="entity-item ${skill.enabled === false ? '' : 'active'}">
       <div class="entity-main">
         <strong>${escapeHtml(skill.name)} · ${escapeHtml(skill.id)}</strong>
         <span>${escapeHtml(skill.description || 'No description')}</span>
         <span>v${escapeHtml(skill.version ?? '1.0.0')} · ${escapeHtml(runtime)}</span>
+        ${actionCount > 0 ? `<span>${actionCount} action${actionCount === 1 ? '' : 's'}${hosts.length > 0 ? ` · ${escapeHtml(hosts.join(', '))}` : ''}</span>` : ''}
         <span>${escapeHtml(badges)}</span>
       </div>
       <div class="entity-actions">
@@ -1891,6 +2492,7 @@ function renderAgents() {
   els.agentList.innerHTML = state.agents
     .map((agent) => {
       const attached = isAgentInActiveRoom(agent.id);
+      const role = state.roles.find((entry) => entry.id === agent.roleId);
       return `
         <div class="entity-item ${attached ? 'active' : ''}">
           <div class="entity-main">
@@ -1898,10 +2500,13 @@ function renderAgents() {
             <span>${escapeHtml(agent.model)} · ${attached ? 'in this room' : 'not in room'}</span>
             <span>${escapeHtml(agentRoleSummary(agent))}</span>
             <span>${escapeHtml(agentEffectiveSkillSummary(agent))}</span>
+            <span>${escapeHtml(roleSkillPreview(role))}</span>
+            <span>${escapeHtml(roleRiskSummary(role))}</span>
           </div>
           <div class="entity-actions">
             <button type="button" data-open-agent-chat="${escapeHtml(agent.id)}">Chat</button>
             ${attached ? '' : `<button type="button" data-attach-agent="${escapeHtml(agent.id)}">Attach</button>`}
+            <button type="button" data-manage-agent-skills="${escapeHtml(agent.id)}">Manage Skills</button>
             <button type="button" data-test-agent="${escapeHtml(agent.id)}">Test</button>
             <button type="button" data-edit-agent="${escapeHtml(agent.id)}">Edit</button>
             <button type="button" class="danger-button" data-delete-agent="${escapeHtml(agent.id)}">Delete</button>
@@ -1944,6 +2549,15 @@ function renderAgents() {
         item.disabled = false;
         item.textContent = 'Test';
       }
+    });
+  }
+
+  for (const item of els.agentList.querySelectorAll('[data-manage-agent-skills]')) {
+    item.addEventListener('click', () => {
+      const agent = state.agents.find((entry) => entry.id === item.getAttribute('data-manage-agent-skills'));
+      const role = state.roles.find((entry) => entry.id === agent?.roleId);
+      if (!role) return;
+      openRoleEditor(role.id);
     });
   }
 
@@ -2347,6 +2961,53 @@ async function sendApprovalDecision(value) {
       content,
       senderName: 'You',
       replyToMessageId: message.id
+    }
+  });
+  replaceByIdOrPush(state.messages, dispatch.message);
+  renderMessages({ stickToBottom: true });
+  await streamReplies(dispatch.targets);
+}
+
+async function sendCredentialChoice(value) {
+  let payload = null;
+  try {
+    payload = JSON.parse(decodeURIComponent(String(value ?? '')));
+  } catch {
+    payload = null;
+  }
+  const messageId = String(payload?.messageId ?? '');
+  const credentialId = String(payload?.credentialId ?? '').trim();
+  const credentialName = String(payload?.credentialName ?? '').trim();
+  const message = state.messages.find((entry) => entry.id === messageId);
+  const choice = parseCredentialChoiceMessage(renderMessageContent(message));
+  if (!choice || (!credentialId && !credentialName) || !state.activeRoomId) return;
+  const credentialLabel = credentialName || credentialId;
+  const content = [
+    `Use credential "${credentialLabel}" for ${choice.skillId}.${choice.actionId}.`,
+    `This credential is locked for this attempt. If the action fails, report the failure for this credential and do not switch to another credential unless I explicitly choose one.`,
+    '',
+    'Continue the requested action by emitting this skill action with the selected credential and original input:',
+    '```agentim-skill-action',
+    JSON.stringify({
+      skillId: choice.skillId,
+      action: choice.actionId,
+      credential: credentialId || credentialName,
+      input: choice.input ?? {}
+    }, null, 2),
+    '```',
+    '',
+    'Original input:',
+    '```json',
+    JSON.stringify(choice.input ?? {}, null, 2),
+    '```'
+  ].join('\n');
+  const dispatch = await api(`/api/rooms/${state.activeRoomId}/dispatch`, {
+    method: 'POST',
+    body: {
+      content,
+      targetAgentIds: choice.agentId ? [choice.agentId] : [],
+      senderName: 'You',
+      replyToMessageId: messageId
     }
   });
   replaceByIdOrPush(state.messages, dispatch.message);
@@ -2887,9 +3548,9 @@ function effectiveRoleSkillIds(role) {
 function renderConversation() {
   const room = state.rooms.find((c) => c.id === state.activeRoomId);
   const dmAgent = room?.type === 'dm'
-    ? state.roomAgents.find((item) => item.roomId === room.id && item.enabled !== false)
-      ? state.agents.find((agent) => agent.id === state.roomAgents.find((item) => item.roomId === room.id && item.enabled !== false)?.agentId)
-      : null
+    ? state.agents.find((agent) => agent.id === room.dmAgentId)
+      ?? state.agents.find((agent) => agent.id === state.roomAgents.find((item) => item.roomId === room.id && item.enabled !== false)?.agentId)
+      ?? null
     : null;
   const conversationName = room?.type === 'dm'
     ? dmAgent?.name ?? room?.name ?? 'Direct chat'
@@ -3320,6 +3981,42 @@ function setApiStatus(text) {
   }
 }
 
+function updateRuntimeInfo(runtime) {
+  if (!runtime) return;
+  const previousId = state.runtime?.instanceId;
+  state.runtime = runtime;
+  setApiStatus(onlineStatusLabel());
+  renderRuntimeInfo();
+  if (previousId && runtime.instanceId && previousId !== runtime.instanceId) {
+    flashStatus(`API restarted · ${runtime.instanceId}`);
+  }
+}
+
+function onlineStatusLabel() {
+  return state.runtime?.instanceId
+    ? `Online · ${state.runtime.instanceId}`
+    : 'Online';
+}
+
+function renderRuntimeInfo() {
+  if (!els.runtimeInfo) return;
+  const runtime = state.runtime ?? {};
+  const started = runtime.startedAt ? new Date(runtime.startedAt).toLocaleString() : 'Unknown';
+  els.runtimeInfo.innerHTML = `
+    <div class="entity-main">
+      <strong>API Runtime</strong>
+      <span>Version: ${escapeHtml(runtime.version ?? 'unknown')}</span>
+      <span>Instance: ${escapeHtml(runtime.instanceId ?? 'unknown')}</span>
+      <span>Started: ${escapeHtml(started)}</span>
+    </div>
+  `;
+}
+
+function flashStatus(text) {
+  setApiStatus(text);
+  setTimeout(() => setApiStatus(onlineStatusLabel()), 2400);
+}
+
 function activateWorkTab(name) {
   const target = name || 'work';
   for (const tab of els.workTabs) {
@@ -3555,6 +4252,21 @@ function renderMessages(options = {}) {
       await sendApprovalDecision(item.getAttribute('data-approval-decision'));
     });
   }
+
+  for (const item of els.messages.querySelectorAll('[data-credential-choice]')) {
+    item.addEventListener('click', async () => {
+      await sendCredentialChoice(item.getAttribute('data-credential-choice'));
+    });
+  }
+
+  for (const item of els.messages.querySelectorAll('[data-open-settings-tab]')) {
+    item.addEventListener('click', () => {
+      activateAppSection('settings');
+      activateSectionTab(item.getAttribute('data-open-settings-tab'));
+    });
+  }
+
+  bindSkillApprovalActions(els.messages);
 }
 
 function isMessagesNearBottom(threshold = 96) {
@@ -3732,18 +4444,19 @@ function renderSkillInvocations() {
 }
 
 function renderSkillApprovalItem(approval, className = 'entity-item active') {
-  const path = approval.input?.path ?? '';
+  const summary = formatApprovalActivity(approval);
   return `
     <div class="${className}">
       <div class="entity-main">
-        <strong>${escapeHtml(approval.title ?? approval.skillId)} · ${escapeHtml(approval.status)}</strong>
-        <span>${escapeHtml(approval.reason || approval.skillId)}</span>
-        <span>${escapeHtml(path || approval.input?.action || 'Approval required')}</span>
-        <span>${escapeHtml(approval.createdAt ? new Date(approval.createdAt).toLocaleTimeString() : '')}</span>
+        <strong>${escapeHtml(summary.title)}</strong>
+        <span>${escapeHtml(summary.meta)}</span>
+        <span>${escapeHtml(summary.detail)}</span>
+        ${summary.extra ? `<span>${escapeHtml(summary.extra)}</span>` : ''}
       </div>
       ${approval.status === 'pending' ? `
         <div class="approval-actions">
-          <button type="button" data-skill-approval-action="approve" data-skill-approval-id="${escapeHtml(approval.id)}">Approve</button>
+          <button type="button" data-skill-approval-action="approve" data-skill-approval-id="${escapeHtml(approval.id)}">Approve once</button>
+          <button type="button" data-skill-approval-action="approve-room" data-skill-approval-id="${escapeHtml(approval.id)}">Trust in this chat</button>
           <button type="button" class="danger-button" data-skill-approval-action="reject" data-skill-approval-id="${escapeHtml(approval.id)}">Reject</button>
         </div>
       ` : ''}
@@ -3764,9 +4477,11 @@ function bindSkillApprovalActions(root) {
 }
 
 async function decideSkillApproval(approvalId, action) {
-  if (!approvalId || !['approve', 'reject'].includes(action)) return;
-  const result = await api(`/api/skill-approvals/${encodeURIComponent(approvalId)}/${action}`, {
-    method: 'POST'
+  if (!approvalId || !['approve', 'approve-room', 'reject'].includes(action)) return;
+  const endpointAction = action === 'approve-room' ? 'approve' : action;
+  const result = await api(`/api/skill-approvals/${encodeURIComponent(approvalId)}/${endpointAction}`, {
+    method: 'POST',
+    body: action === 'approve-room' ? { trustScope: 'room' } : undefined
   });
   if (result.approval) replaceByIdOrPush(state.skillApprovals, result.approval);
   if (result.invocation) replaceByIdOrPush(state.skillInvocations, result.invocation);
@@ -4598,6 +5313,51 @@ function enabledSkills() {
   return state.skills.filter((skill) => skill.enabled !== false);
 }
 
+function previewSkillManifest(manifest) {
+  const errors = [];
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) errors.push('Manifest must be an object.');
+  if (!String(manifest?.id ?? '').trim()) errors.push('id is required.');
+  if (!String(manifest?.name ?? '').trim()) errors.push('name is required.');
+  const actions = Array.isArray(manifest?.actions) ? manifest.actions : [];
+  const credentialTypes = manifest?.credentialTypes && typeof manifest.credentialTypes === 'object' && !Array.isArray(manifest.credentialTypes)
+    ? Object.keys(manifest.credentialTypes)
+    : [];
+  const hosts = [
+    ...(manifest?.permissions?.network?.hosts ?? []),
+    ...actions.flatMap((action) => action?.permissions?.network?.hosts ?? [])
+  ].filter(Boolean);
+  const summary = [
+    `Runtime: ${manifest?.runtime?.kind ?? 'unknown'}${manifest?.runtime?.adapter ? `:${manifest.runtime.adapter}` : ''}`,
+    `Actions: ${actions.length}`,
+    `Credential types: ${credentialTypes.length ? credentialTypes.join(', ') : 'none'}`,
+    `Network hosts: ${hosts.length ? [...new Set(hosts)].join(', ') : 'none'}`,
+    `Risk: ${manifest?.riskLevel ?? 'medium'}${manifest?.requiresApproval ? ' · requires approval' : ''}`
+  ];
+  return { ok: errors.length === 0, errors, summary };
+}
+
+function renderSkillPreview(preview) {
+  if (!els.skillPreview) return;
+  els.skillPreview.hidden = false;
+  els.skillPreview.innerHTML = `
+    <strong>${preview.ok ? 'Manifest looks valid' : 'Manifest needs changes'}</strong>
+    ${(preview.errors ?? []).map((error) => `<span>${escapeHtml(error)}</span>`).join('')}
+    ${(preview.summary ?? []).map((line) => `<span>${escapeHtml(line)}</span>`).join('')}
+  `;
+}
+
+function skillManifestNeedsInstallConfirmation(manifest) {
+  return Boolean(
+    manifest?.requiresApproval ||
+    manifest?.policy?.network ||
+    manifest?.policy?.destructive ||
+    manifest?.policy?.externalEffect ||
+    manifest?.permissions?.approval ||
+    manifest?.permissions?.network ||
+    String(manifest?.riskLevel ?? '').toLowerCase() === 'high'
+  );
+}
+
 function skillManifestForEdit(skill) {
   return {
     id: skill.id,
@@ -4609,6 +5369,10 @@ function skillManifestForEdit(skill) {
     runtime: skill.runtime ?? { kind: 'external', adapter: 'manual' },
     inputSchema: skill.inputSchema ?? { type: 'object' },
     outputSchema: skill.outputSchema ?? { type: 'object' },
+    credentialTypes: skill.credentialTypes ?? {},
+    credentials: skill.credentials ?? [],
+    permissions: skill.permissions ?? {},
+    actions: skill.actions ?? [],
     policy: skill.policy ?? { workspace: 'none', network: false, destructive: false },
     ui: skill.ui ?? { card: 'skill-result' },
     riskLevel: skill.riskLevel ?? 'medium',
@@ -4636,6 +5400,10 @@ function defaultSkillManifest() {
       type: 'object',
       properties: {}
     },
+    credentialTypes: {},
+    credentials: [],
+    permissions: {},
+    actions: [],
     policy: {
       workspace: 'none',
       network: false,
@@ -4714,6 +5482,7 @@ function resetRoomForm() {
 
 function resetProviderForm() {
   state.editingProviderId = null;
+  state.providerProbeRequestId += 1;
   els.providerForm.reset();
   els.providerForm.elements.name.value = 'Mock Provider';
   els.providerForm.elements.baseUrl.value = 'mock://provider';
@@ -4723,6 +5492,10 @@ function resetProviderForm() {
   els.providerForm.elements.defaultModel.value = 'mock-agent';
   els.providerSubmit.textContent = 'Save';
   els.providerCancel.hidden = true;
+  els.probeButton.disabled = false;
+  els.probeButton.textContent = 'Probe';
+  els.probeResult.textContent = '';
+  els.probeResult.style.display = 'none';
 }
 
 function resetRoleForm() {
@@ -4742,6 +5515,10 @@ function resetSkillForm() {
   els.skillForm.elements.manifest.value = JSON.stringify(defaultSkillManifest(), null, 2);
   els.skillSubmit.textContent = 'Install Skill';
   els.skillCancel.hidden = true;
+  if (els.skillPreview) {
+    els.skillPreview.hidden = true;
+    els.skillPreview.innerHTML = '';
+  }
 }
 
 function resetAgentForm() {
@@ -4871,6 +5648,7 @@ function connectEventStream() {
     'room.updated',
     'room.deleted',
     'room.members.updated',
+    'skill_approval.created',
     'agent.created',
     'agent.updated',
     'agent.deleted',
@@ -4901,7 +5679,7 @@ function handlePlatformEvent(type, event) {
     detail = {};
   }
   const payload = detail?.payload ?? {};
-  if (type.startsWith('message.') || type.startsWith('agent_run.')) {
+  if (type.startsWith('message.') || type.startsWith('agent_run.') || type.startsWith('skill_approval.')) {
     handleRoomActivityEvent(type, payload);
     return;
   }
@@ -4958,6 +5736,7 @@ async function refreshActiveRoomFromEvent(options = {}) {
     renderProjects();
     renderAgentWorkCenter();
     renderSkillInvocations();
+    renderTrustedApprovals();
     renderArtifacts();
     renderRoomInspector();
     if (hasPendingWork()) {
@@ -5100,6 +5879,7 @@ async function refreshActiveRoomResources() {
 
 async function refreshGlobalState() {
   const boot = await api('/api/bootstrap');
+  updateRuntimeInfo(boot.runtime);
   const previousActiveRoomId = state.activeRoomId;
   state.settings = boot.settings ?? state.settings;
   state.providers = boot.providers ?? state.providers;
@@ -5338,6 +6118,12 @@ function renderMessageBody(message) {
   if (roomManagement) return renderRoomManagementCard(roomManagement);
   const taskPlan = parseTaskPlanMessage(content);
   if (taskPlan) return renderTaskPlanCard(taskPlan, message.id);
+  const credentialChoice = parseCredentialChoiceMessage(content);
+  if (credentialChoice) return renderCredentialChoiceCard(credentialChoice, message);
+  const skillApproval = parseSkillApprovalMessage(content);
+  if (skillApproval) return renderSkillApprovalCard(skillApproval);
+  const actionError = parseActionErrorMessage(content);
+  if (actionError) return renderActionErrorCard(actionError);
   const approvalRequest = parseApprovalRequestMessage(content);
   if (approvalRequest) return renderApprovalRequestCard(approvalRequest, message);
   const projectCreated = parseProjectCreatedMessage(content);
@@ -5475,6 +6261,142 @@ function parseApprovalRequestMessage(content) {
   } catch {
     return null;
   }
+}
+
+function parseSkillApprovalMessage(content) {
+  const match = String(content ?? '').match(/```agentim-skill-approval\s*\n([\s\S]*?)```/);
+  if (!match) return null;
+  try {
+    const payload = JSON.parse(match[1]);
+    const approvalId = String(payload.approvalId ?? '').trim();
+    if (!approvalId) return null;
+    const current = state.skillApprovals.find((approval) => approval.id === approvalId);
+    return {
+      approvalId,
+      status: current?.status ?? 'pending',
+      title: String(payload.title ?? current?.title ?? 'Skill approval required').trim() || 'Skill approval required',
+      reason: String(payload.reason ?? current?.reason ?? '').trim(),
+      skillName: String(payload.skillName ?? payload.skillId ?? current?.skillId ?? '').trim(),
+      actionName: String(payload.actionName ?? payload.actionId ?? '').trim()
+    };
+  } catch {
+    return null;
+  }
+}
+
+function renderSkillApprovalCard(approval) {
+  const pending = approval.status === 'pending';
+  return `
+    <section class="approval-card">
+      <div class="approval-card-header">
+        <div>
+          <strong>${escapeHtml(approval.title)}</strong>
+          <span>${escapeHtml([approval.skillName, approval.actionName, approval.status].filter(Boolean).join(' · '))}</span>
+        </div>
+      </div>
+      ${approval.reason ? `<p>${escapeHtml(approval.reason)}</p>` : ''}
+      <div class="approval-actions">
+        ${pending ? `
+          <button type="button" data-skill-approval-action="approve" data-skill-approval-id="${escapeHtml(approval.approvalId)}">Approve once</button>
+          <button type="button" data-skill-approval-action="approve-room" data-skill-approval-id="${escapeHtml(approval.approvalId)}">Trust in this chat</button>
+          <button type="button" class="danger-button" data-skill-approval-action="reject" data-skill-approval-id="${escapeHtml(approval.approvalId)}">Reject</button>
+        ` : `<button type="button" disabled>${escapeHtml(approval.status)}</button>`}
+      </div>
+    </section>
+  `;
+}
+
+function parseActionErrorMessage(content) {
+  const text = String(content ?? '');
+  const bracket = text.match(/\[Action error:\s*([\s\S]*?)\]\s*$/);
+  const plain = text.match(/^Action error:\s*([\s\S]*)$/);
+  const message = String(bracket?.[1] ?? plain?.[1] ?? '').trim();
+  if (!message) return null;
+  return {
+    message,
+    fixes: actionErrorFixes(message)
+  };
+}
+
+function actionErrorFixes(message) {
+  const text = String(message ?? '').toLowerCase();
+  const fixes = [];
+  if (text.includes('credential')) fixes.push({ label: 'Open Credentials', tab: 'settings:secrets' });
+  if (text.includes('network policy') || text.includes('api requests') || text.includes('http requests') || text.includes('localhost') || text.includes('private network')) {
+    fixes.push({ label: 'Open Network', tab: 'settings:network' });
+  }
+  if (text.includes('provider') || text.includes('api key') || text.includes('timed out')) fixes.push({ label: 'Open Providers', tab: 'settings:providers' });
+  if (text.includes('required skill') || text.includes('agent does not have')) fixes.push({ label: 'Open Roles', tab: 'settings:roles' });
+  return fixes.length > 0 ? fixes : [{ label: 'Open Activity', tab: 'settings:chats' }];
+}
+
+function renderActionErrorCard(error) {
+  return `
+    <section class="approval-card action-error-card">
+      <div class="approval-card-header">
+        <div>
+          <strong>Action failed</strong>
+          <span>${escapeHtml(error.message)}</span>
+        </div>
+      </div>
+      <div class="approval-actions">
+        ${error.fixes.map((fix) => `<button type="button" data-open-settings-tab="${escapeHtml(fix.tab)}">${escapeHtml(fix.label)}</button>`).join('')}
+      </div>
+    </section>
+  `;
+}
+
+function parseCredentialChoiceMessage(content) {
+  const match = String(content ?? '').match(/```agentim-credential-choice\s*\n([\s\S]*?)```/);
+  if (!match) return null;
+  try {
+    const payload = JSON.parse(match[1]);
+    const credentials = Array.isArray(payload.credentials)
+      ? payload.credentials
+        .map((credential) => ({
+          id: String(credential?.id ?? '').trim(),
+          name: String(credential?.name ?? '').trim()
+        }))
+        .filter((credential) => credential.name)
+      : [];
+    if (!payload.skillId || !payload.actionId || credentials.length === 0) return null;
+    return {
+      agentId: String(payload.agentId ?? '').trim(),
+      skillId: String(payload.skillId ?? '').trim(),
+      skillName: String(payload.skillName ?? payload.skillId ?? '').trim(),
+      actionId: String(payload.actionId ?? '').trim(),
+      actionName: String(payload.actionName ?? payload.actionId ?? '').trim(),
+      credentialType: String(payload.credentialType ?? '').trim(),
+      credentials,
+      input: payload.input && typeof payload.input === 'object' ? payload.input : {}
+    };
+  } catch {
+    return null;
+  }
+}
+
+function renderCredentialChoiceCard(choice, message) {
+  return `
+    <section class="approval-card credential-choice-card">
+      <div class="approval-card-header">
+        <div>
+          <strong>Select credential</strong>
+          <span>${escapeHtml(choice.skillName)} · ${escapeHtml(choice.actionName)}</span>
+        </div>
+      </div>
+      <p>${escapeHtml(choice.credentialType ? `Choose a ${choice.credentialType} credential to continue this skill action.` : 'Choose a credential to continue this skill action.')}</p>
+      <div class="approval-actions">
+        ${choice.credentials.map((credential) => {
+    const value = encodeURIComponent(JSON.stringify({
+      messageId: message.id,
+      credentialId: credential.id,
+      credentialName: credential.name
+    }));
+    return `<button type="button" data-credential-choice="${escapeHtml(value)}">${escapeHtml(credential.name)}</button>`;
+  }).join('')}
+      </div>
+    </section>
+  `;
 }
 
 function renderApprovalRequestCard(request, message) {
@@ -5785,6 +6707,8 @@ function formatInvocationTime(invocation) {
 }
 
 function formatInspectorActivity(invocation) {
+  const actor = formatInvocationActor(invocation);
+  const time = formatInvocationTime(invocation) || 'pending';
   if (invocation.skillId === 'provider.chat') {
     const diagnostics = invocation.output?.diagnostics ?? {};
     const usage = diagnostics.usage ?? {};
@@ -5800,8 +6724,8 @@ function formatInspectorActivity(invocation) {
     const body = diagnostics.response?.bodyPreview ? ` · body: ${summarizeInline(diagnostics.response.bodyPreview, 140)}` : '';
     return {
       title: `Provider chat · ${invocation.status}`,
-      meta: `${diagnostics.providerName ?? invocation.input?.providerId ?? 'Provider'} · ${diagnostics.model ?? invocation.input?.model ?? 'model'}`,
-      detail: `${diagnostics.mode ?? 'chat'}${http}${finish}${tokens}${fallback}${streamError}${body}`
+      meta: `${actor} · ${diagnostics.providerName ?? invocation.input?.providerId ?? 'Provider'} · ${diagnostics.model ?? invocation.input?.model ?? 'model'}`,
+      detail: `${diagnostics.mode ?? 'chat'} · ${time}${http}${finish}${tokens}${fallback}${streamError}${body}`
     };
   }
   if (invocation.skillId === 'agent.message') {
@@ -5818,12 +6742,84 @@ function formatInspectorActivity(invocation) {
       detail: `${agent} · ${verb} ${formatInvocationTime(invocation) || 'pending'}${messageId}${error}`
     };
   }
+  if (invocation.skillId === 'api.request' || invocation.output?.url || invocation.input?.url) {
+    const method = invocation.output?.method ?? invocation.input?.method ?? 'GET';
+    const url = invocation.output?.url ?? invocation.input?.url ?? '';
+    const host = formatUrlHost(url);
+    const status = invocation.output?.status !== undefined
+      ? `HTTP ${invocation.output.status}`
+      : invocation.status ?? 'queued';
+    const contentType = invocation.output?.contentType ? ` · ${invocation.output.contentType}` : '';
+    const bytes = invocation.output?.bodyLength !== undefined ? ` · ${formatBytes(invocation.output.bodyLength)}` : '';
+    const truncated = invocation.output?.truncated ? ' · truncated' : '';
+    return {
+      title: `${invocation.skillId} · ${invocation.status}`,
+      meta: `${actor} · ${method} ${host || 'request'}`,
+      detail: `${status}${contentType}${bytes}${truncated} · ${time}`
+    };
+  }
+  if (invocation.skillId && !invocation.skillId.includes('.')) {
+    const action = invocation.output?.actionId ?? invocation.input?.action ?? invocation.input?.actionId ?? 'action';
+    const credential = invocation.output?.credentialName
+      ?? invocation.input?.credentialName
+      ?? invocation.input?.credential
+      ?? '';
+    const target = invocation.output?.url ?? invocation.input?.url ?? invocation.output?.path ?? invocation.input?.path ?? '';
+    const status = invocation.output?.status !== undefined ? `HTTP ${invocation.output.status}` : invocation.status;
+    return {
+      title: `${invocation.skillId} · ${action} · ${invocation.status}`,
+      meta: [actor, credential ? `credential: ${credential}` : '', target ? formatUrlHost(target) || target : ''].filter(Boolean).join(' · '),
+      detail: [status, invocation.output?.contentType, time].filter(Boolean).join(' · ')
+    };
+  }
   const path = invocation.output?.path ?? invocation.input?.path ?? invocation.output?.roomName ?? invocation.input?.targetRoomName ?? '';
   return {
     title: `${invocation.skillId} · ${invocation.status}`,
-    meta: path || invocation.input?.action || 'No target',
-    detail: formatInvocationTime(invocation)
+    meta: [actor, path || invocation.input?.action || 'No target'].filter(Boolean).join(' · '),
+    detail: time
   };
+}
+
+function formatApprovalActivity(approval) {
+  const input = approval.input ?? {};
+  const request = input.request ?? {};
+  const action = input.actionId ?? request.action ?? input.action ?? '';
+  const credential = input.credentialName ?? input.credential ?? '';
+  const trust = input.trustScope === 'room'
+    ? 'trusted in this chat'
+    : input.trustRevokedAt
+      ? 'trust revoked'
+      : approval.status === 'pending'
+        ? 'approval required'
+        : approval.status;
+  const created = approval.createdAt ? new Date(approval.createdAt).toLocaleTimeString() : '';
+  return {
+    title: `${approval.title ?? approval.skillId} · ${approval.status}`,
+    meta: [
+      approval.requestedBy ? `requested by ${approval.requestedBy}` : '',
+      input.skillId ?? approval.skillId,
+      action,
+      credential ? `credential: ${credential}` : ''
+    ].filter(Boolean).join(' · '),
+    detail: [trust, created].filter(Boolean).join(' · '),
+    extra: approval.reason || ''
+  };
+}
+
+function formatInvocationActor(invocation) {
+  const agent = state.agents.find((item) => item.id === invocation.agentId);
+  if (agent?.name) return agent.name;
+  if (invocation.actorType) return invocation.actorType;
+  return 'system';
+}
+
+function formatUrlHost(value) {
+  try {
+    const url = new URL(String(value ?? ''));
+    return url.host || url.href;
+  } catch {
+    return String(value ?? '').slice(0, 80);
+  }
 }
 
 function formatTaskTime(task) {

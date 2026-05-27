@@ -1,4 +1,7 @@
 import { createHash, pbkdf2Sync, randomBytes, timingSafeEqual } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export function createId() {
   return crypto.randomUUID();
@@ -6,6 +9,50 @@ export function createId() {
 
 export function nowIso() {
   return new Date().toISOString();
+}
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const BUILTIN_SKILLS_DIR = path.resolve(__dirname, '../skills');
+const LOCAL_SKILLS_DIR = path.resolve(__dirname, '../../data/skills');
+
+function loadFileSkills() {
+  return [
+    ...loadSkillFilesFromDir(BUILTIN_SKILLS_DIR),
+    ...loadSkillFilesFromDir(LOCAL_SKILLS_DIR)
+  ];
+}
+
+function loadSkillFilesFromDir(dir) {
+  if (!fs.existsSync(dir)) return [];
+  const files = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      files.push(path.join(dir, entry.name, 'skill.json'));
+    } else if (entry.isFile() && entry.name.endsWith('.json')) {
+      files.push(path.join(dir, entry.name));
+    }
+  }
+  return files
+    .sort((a, b) => a.localeCompare(b))
+    .map(readSkillFile)
+    .filter(Boolean);
+}
+
+function readSkillFile(filePath) {
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const skill = JSON.parse(raw);
+    return skill && typeof skill === 'object' && !Array.isArray(skill)
+      ? {
+        ...skill,
+        source: skill.source ?? (filePath.startsWith(BUILTIN_SKILLS_DIR) ? 'system-file' : 'local-file'),
+        sourcePath: filePath
+      }
+      : null;
+  } catch (error) {
+    console.warn(`Failed to load skill file ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
 }
 
 export const DEFAULT_SKILLS = [
@@ -98,6 +145,24 @@ export const DEFAULT_SKILLS = [
     riskLevel: 'medium',
     requiresApproval: false,
     description: 'Read public web pages and public GitHub repositories for research and code analysis.'
+  },
+  {
+    id: 'api.request',
+    name: 'API Request',
+    version: '1.0.0',
+    category: 'integration',
+    common: true,
+    installed: true,
+    enabled: true,
+    source: 'system',
+    runtime: { kind: 'server', adapter: 'agentim.api-request' },
+    inputSchema: { type: 'object' },
+    outputSchema: { type: 'object' },
+    policy: { workspace: 'none', network: true, destructive: false },
+    ui: { card: 'message' },
+    riskLevel: 'medium',
+    requiresApproval: false,
+    description: 'Call HTTP and HTTPS APIs using controlled requests and configured secrets.'
   },
   {
     id: 'artifact.card',
@@ -801,7 +866,7 @@ export const DEFAULT_SKILLS = [
     requiresApproval: false,
     description: 'Call the configured OpenAI-compatible model provider.'
   }
-];
+].concat(loadFileSkills());
 
 export const COMMON_SKILL_IDS = DEFAULT_SKILLS.filter((skill) => skill.common).map((skill) => skill.id);
 export const STANDARD_ROLE_SKILL_IDS = [
@@ -811,6 +876,8 @@ export const STANDARD_ROLE_SKILL_IDS = [
   'workspace.preview',
   'workspace.export',
   'web.read',
+  'api.request',
+  'weather',
   'artifact.card',
   'agent.message',
   'role.read',
@@ -983,15 +1050,26 @@ function normalizeSkills(rawSkills) {
   const byId = new Map(DEFAULT_SKILLS.map((skill) => [skill.id, normalizeSkill(skill, skill)]));
   for (const skill of customSkills) {
     if (!skill?.id) continue;
-    const existing = byId.get(String(skill.id));
-    byId.set(String(skill.id), normalizeSkill(skill, existing));
+    const id = normalizeLegacySkillId(skill.id);
+    const existing = byId.get(id);
+    if (existing?.source === 'system-file') {
+      byId.set(id, normalizeSkill({
+        ...existing,
+        id,
+        enabled: skill.enabled,
+        createdAt: skill.createdAt ?? existing.createdAt,
+        updatedAt: existing.updatedAt ?? skill.updatedAt
+      }, existing));
+    } else {
+      byId.set(id, normalizeSkill({ ...skill, id }, existing));
+    }
   }
   return Array.from(byId.values());
 }
 
 export function normalizeSkill(skill, existing) {
   const isSystem = Boolean(existing?.common || skill?.common);
-  const id = String(skill?.id ?? existing?.id ?? '').trim();
+  const id = normalizeLegacySkillId(skill?.id ?? existing?.id ?? '');
   return {
     id,
     name: String(skill?.name ?? existing?.name ?? id),
@@ -1001,10 +1079,19 @@ export function normalizeSkill(skill, existing) {
     common: isSystem,
     installed: true,
     enabled: isSystem ? true : skill?.enabled === undefined ? existing?.enabled !== false : Boolean(skill.enabled),
-    source: isSystem ? 'system' : String(skill?.source ?? existing?.source ?? 'manual'),
+    source: String(skill?.source ?? existing?.source ?? (isSystem ? 'system' : 'manual')),
+    sourcePath: skill?.sourcePath ?? existing?.sourcePath,
     runtime: normalizeJsonObject(skill?.runtime ?? existing?.runtime, { kind: 'external', adapter: 'manual' }),
     inputSchema: normalizeJsonObject(skill?.inputSchema ?? existing?.inputSchema, { type: 'object' }),
     outputSchema: normalizeJsonObject(skill?.outputSchema ?? existing?.outputSchema, { type: 'object' }),
+    credentialTypes: normalizeJsonObject(skill?.credentialTypes ?? existing?.credentialTypes, {}),
+    credentials: Array.isArray(skill?.credentials ?? existing?.credentials)
+      ? (skill?.credentials ?? existing?.credentials).filter((credential) => credential && typeof credential === 'object')
+      : [],
+    permissions: normalizeJsonObject(skill?.permissions ?? existing?.permissions, {}),
+    actions: Array.isArray(skill?.actions ?? existing?.actions)
+      ? (skill?.actions ?? existing?.actions).filter((action) => action && typeof action === 'object')
+      : [],
     policy: normalizeJsonObject(skill?.policy ?? existing?.policy, {
       workspace: 'none',
       network: false,
@@ -1052,7 +1139,13 @@ function normalizeRoles(rawRoles) {
 
 function normalizeRoleSkillIds(value) {
   if (!Array.isArray(value)) return [];
-  return [...new Set(value.map((item) => String(item ?? '').trim()).filter(Boolean))];
+  return [...new Set(value.map(normalizeLegacySkillId).filter(Boolean))];
+}
+
+function normalizeLegacySkillId(value) {
+  const id = String(value ?? '').trim();
+  if (id === 'weather.current') return 'weather';
+  return id;
 }
 
 function normalizeAgent(agent) {
@@ -1293,6 +1386,19 @@ export function createDefaultSettings() {
       proxyUrl: '',
       providerTimeoutMs: 300000
     },
+    apiRequest: {
+      enabled: true,
+      allowlistEnabled: false,
+      allowedHosts: [],
+      allowHttp: true,
+      allowLocalhost: true,
+      allowPrivateNetwork: true,
+      timeoutMs: 30000,
+      maxResponseBytes: 512000
+    },
+    secrets: [],
+    credentials: [],
+    customCredentialTypes: [],
     chat: {
       messagePageSize: 20
     },
@@ -1320,6 +1426,10 @@ export function normalizeSettings(raw) {
       proxyUrl: String(raw?.network?.proxyUrl ?? fallback.network.proxyUrl).trim(),
       providerTimeoutMs: normalizeTimeoutMs(raw?.network?.providerTimeoutMs, fallback.network.providerTimeoutMs)
     },
+    apiRequest: normalizeApiRequestSettings(raw?.apiRequest, fallback.apiRequest),
+    secrets: normalizeSecrets(raw?.secrets),
+    credentials: normalizeCredentials(raw?.credentials),
+    customCredentialTypes: normalizeCustomCredentialTypes(raw?.customCredentialTypes),
     chat: {
       messagePageSize: normalizeMessagePageSize(raw?.chat?.messagePageSize, fallback.chat.messagePageSize)
     },
@@ -1330,6 +1440,118 @@ export function normalizeSettings(raw) {
       roomTemplates: normalizeCustomRoomTemplates(raw?.circles?.roomTemplates)
     }
   };
+}
+
+function normalizeApiRequestSettings(raw, fallback) {
+  return {
+    enabled: raw?.enabled === undefined ? fallback.enabled : Boolean(raw.enabled),
+    allowlistEnabled: raw?.allowlistEnabled === undefined ? fallback.allowlistEnabled : Boolean(raw.allowlistEnabled),
+    allowedHosts: normalizeHostList(raw?.allowedHosts),
+    allowHttp: raw?.allowHttp === undefined ? fallback.allowHttp : Boolean(raw.allowHttp),
+    allowLocalhost: raw?.allowLocalhost === undefined ? fallback.allowLocalhost : Boolean(raw.allowLocalhost),
+    allowPrivateNetwork: raw?.allowPrivateNetwork === undefined ? fallback.allowPrivateNetwork : Boolean(raw.allowPrivateNetwork),
+    timeoutMs: normalizeApiRequestTimeout(raw?.timeoutMs, fallback.timeoutMs),
+    maxResponseBytes: normalizeMaxResponseBytes(raw?.maxResponseBytes, fallback.maxResponseBytes)
+  };
+}
+
+function normalizeHostList(value) {
+  const rows = Array.isArray(value)
+    ? value
+    : String(value ?? '').split(/[\n,]/);
+  return [...new Set(rows
+    .map((item) => String(item ?? '').trim().toLowerCase())
+    .filter(Boolean)
+    .slice(0, 200))];
+}
+
+function normalizeMaxResponseBytes(value, fallback) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(Math.max(Math.round(number), 1024), 5 * 1024 * 1024);
+}
+
+function normalizeApiRequestTimeout(value, fallback) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(Math.max(Math.round(number), 1000), 300000);
+}
+
+function normalizeSecrets(value) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set();
+  return value
+    .map((secret) => {
+      const name = String(secret?.name ?? '').trim();
+      if (!name || seen.has(name)) return null;
+      seen.add(name);
+      return {
+        id: String(secret?.id ?? createId()),
+        name,
+        value: String(secret?.value ?? ''),
+        createdAt: String(secret?.createdAt ?? nowIso()),
+        updatedAt: String(secret?.updatedAt ?? secret?.createdAt ?? nowIso())
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 100);
+}
+
+function normalizeCredentials(value) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set();
+  return value
+    .map((credential) => {
+      const id = String(credential?.id ?? createId()).trim();
+      const type = String(credential?.type ?? '').trim();
+      const name = String(credential?.name ?? '').trim();
+      if (!id || !type || !name || seen.has(id)) return null;
+      seen.add(id);
+      return {
+        id,
+        type,
+        name,
+        values: normalizeJsonObject(credential?.values, {}),
+        createdAt: String(credential?.createdAt ?? nowIso()),
+        updatedAt: String(credential?.updatedAt ?? credential?.createdAt ?? nowIso())
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 500);
+}
+
+function normalizeCustomCredentialTypes(value) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set();
+  return value
+    .map((type) => {
+      const id = String(type?.id ?? '').trim();
+      const name = String(type?.name ?? id).trim();
+      if (!id || !name || seen.has(id)) return null;
+      seen.add(id);
+      const fields = Array.isArray(type?.fields)
+        ? type.fields
+          .map((field) => ({
+            name: String(field?.name ?? '').trim(),
+            label: String(field?.label ?? field?.name ?? '').trim(),
+            type: String(field?.type ?? 'string').trim() || 'string',
+            required: Boolean(field?.required),
+            default: field?.default,
+            options: Array.isArray(field?.options) ? field.options : undefined
+          }))
+          .filter((field) => field.name)
+        : [];
+      return {
+        id,
+        name,
+        fields,
+        source: String(type?.source ?? 'user').trim() || 'user',
+        createdAt: String(type?.createdAt ?? nowIso()),
+        updatedAt: String(type?.updatedAt ?? type?.createdAt ?? nowIso())
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 200);
 }
 
 function normalizeCustomRoomTemplates(value) {
